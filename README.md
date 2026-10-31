@@ -6,7 +6,8 @@ Cloud project, your API quota, your channel.
 
 What Claude can do with it: upload a video (with title, description, tags, category, privacy or a scheduled
 `publish_at`, AI-content disclosure), set a thumbnail, add captions, edit a video's metadata or schedule, list
-recent uploads, and manage playlists.
+recent uploads, and manage playlists. Optionally it can also publish Reels to your Instagram professional
+account (see [Instagram Reels](#instagram-reels-optional)).
 
 ## Set it up (about 15 minutes)
 
@@ -44,6 +45,7 @@ Fork this repository (or use it as a template) into your own GitHub account.
 | `ALLOWED_EMAILS` | strongly recommended | Your Google account email(s), comma-separated. Anyone else is refused. |
 | `PUBLIC_URL` | optional | e.g. `https://my-uploader.vercel.app` if you use a custom domain |
 | `GITHUB_TOKEN`, `MEDIA_REPO` (owner/repo), `SKETCHFAB_TOKEN` | optional | Only for the GitHub-relay and Sketchfab tools |
+| `INSTAGRAM_APP_ID`, `INSTAGRAM_APP_SECRET` | optional | Only for Instagram Reels. The Instagram tools appear only when these are set. |
 
 Check it: opening `https://tubedrop.vercel.app/` shows a short "TubeDrop" page.
 
@@ -72,6 +74,41 @@ YouTube, and `kind: "thumbnail"` / `"captions"` attach to an existing video.
 
 Uploads default to **private**. Scheduled videos use `privacy: private` plus `publish_at`; setting
 `privacy: public` on a scheduled video publishes it now.
+
+## Instagram Reels (optional)
+
+TubeDrop can also publish a Drive video as a Reel on your Instagram **Business or Creator** account, through
+the *Instagram API with Instagram Login* (no Facebook Page needed).
+
+### Set it up
+
+1. At <https://developers.facebook.com/apps> create an app (type *Business*) and add the **Instagram** product,
+   choosing *API setup with Instagram login*.
+2. Under **Business login settings**, add the redirect URL `https://tubedrop.vercel.app/instagram/callback`.
+3. Under **App roles → Roles**, add your Instagram account as an *Instagram tester* and accept the invite in the
+   Instagram app (Settings → Website permissions → Apps and websites). For your own account you do not need
+   Meta's App Review; other people's accounts would.
+4. Copy the **Instagram app ID** and **Instagram app secret** into Vercel as `INSTAGRAM_APP_ID` and
+   `INSTAGRAM_APP_SECRET`, then redeploy.
+5. Ask Claude to "connect Instagram". It calls `instagram_connect` and gives you a one-time link (30 minutes);
+   open it, sign in, and allow access. `whoami` then shows the linked account.
+
+### How it works
+
+1. Get the video into Drive the usual way (`get_upload_url` with `kind: "drive"`).
+2. `instagram_publish_reel` with the Drive id, caption and optionally a JPEG `cover_drive_file`. Instagram Login
+   apps publish from a URL, so TubeDrop gives Meta a link to `/ig/media/<job>/video?t=<secret>`, which streams the
+   Drive file. Each link has its own random secret and stops working once the Reel is published or fails.
+3. Instagram processes the video; call `instagram_continue_publish` about once a minute until it says done. The
+   result has the Reel's link, and the video and cover are deleted from the Drive uploads folder.
+
+`instagram_list_media` lists recent posts and how much of the 24-hour API publishing limit is used. The
+Instagram sign-in lasts 60 days and is renewed automatically whenever the tools are used (at most once a day).
+
+**A Reel is public as soon as it is published.** The API has no private or scheduled posts, so the publish tool
+requires `user_confirmed: true` and Claude is told to post only when you have clearly said so.
+
+Reel specs: MP4 or MOV, H.264 or HEVC, AAC audio, 3 seconds to 15 minutes, 9:16 recommended, at most 300 MB.
 
 ## Limits worth knowing
 

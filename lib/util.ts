@@ -81,6 +81,9 @@ async function migrate(s: any) {
     await s`ALTER TABLE users ADD COLUMN IF NOT EXISTS yt_access_enc text`;
     await s`ALTER TABLE users ADD COLUMN IF NOT EXISTS yt_expiry timestamptz`;
     await s`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS kind text`;
+    // Instagram (optional): one linked professional account per user, and one-time connect links.
+    await s`CREATE TABLE IF NOT EXISTS instagram_accounts (user_id text PRIMARY KEY, ig_user_id text NOT NULL, username text, token_enc text NOT NULL, token_expiry timestamptz NOT NULL, refreshed_at timestamptz NOT NULL)`;
+    await s`CREATE TABLE IF NOT EXISTS ig_links (state text PRIMARY KEY, user_id text NOT NULL, created_at timestamptz DEFAULT now())`;
   }
 }
 
