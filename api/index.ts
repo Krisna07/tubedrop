@@ -4,7 +4,8 @@
  */
 import { authenticate, authorize, authServerMetadata, googleCallback, protectedResourceMetadata, register, token } from "../lib/oauth.js";
 import { ToolError } from "../lib/google.js";
-import { callTool, TOOLS } from "../lib/tools.js";
+import { serveMedia } from "../lib/instagram.js";
+import { callTool, tools } from "../lib/tools.js";
 import { baseUrl, html, json } from "../lib/util.js";
 
 const SERVER_INFO = { name: "tubedrop", title: "TubeDrop", version: "1.1.0" };
@@ -24,7 +25,7 @@ function withCors(r: Response): Response {
 
 type Rpc = { jsonrpc: "2.0"; id?: string | number | null; method?: string; params?: any };
 
-async function handleRpc(msg: Rpc, userId: string): Promise<object | null> {
+async function handleRpc(msg: Rpc, userId: string, req: Request): Promise<object | null> {
   const reply = (result: unknown) => ({ jsonrpc: "2.0", id: msg.id, result });
   const fail = (code: number, message: string) => ({ jsonrpc: "2.0", id: msg.id ?? null, error: { code, message } });
   if (msg.id === undefined) return null;                      // notifications get no reply
@@ -39,18 +40,20 @@ async function handleRpc(msg: Rpc, userId: string): Promise<object | null> {
           "Uploads videos to the user's YouTube channel. To send a local file: get_upload_url (kind 'drive') and PUT the bytes " +
           "to the returned URL, then upload_video with the Drive file id (and thumbnail/captions Drive ids); the Drive copies " +
           "are deleted once YouTube has them. Upload as private or scheduled by default, and only make a video public when " +
-          "the user has clearly said so in this conversation. Large uploads take several continue_upload calls.",
+          "the user has clearly said so in this conversation. Large uploads take several continue_upload calls." +
+          " If Instagram is set up, instagram_publish_reel posts a Drive video as a Reel; a Reel is public as soon as it is " +
+          "published, so only post one when the user has clearly said to in this conversation.",
       });
     }
     case "ping":
       return reply({});
     case "tools/list":
-      return reply({ tools: TOOLS });
+      return reply({ tools: tools() });
     case "tools/call": {
       const name = msg.params?.name;
       const args = msg.params?.arguments ?? {};
       try {
-        const out = await callTool(userId, name, args);
+        const out = await callTool(userId, name, args, req);
         return reply({ content: [{ type: "text", text: JSON.stringify(out, null, 2) }], structuredContent: Array.isArray(out) ? { items: out } : out });
       } catch (e) {
         const message = e instanceof ToolError ? e.message : `Unexpected error: ${(e as Error).message}`;
@@ -78,10 +81,10 @@ async function mcp(req: Request): Promise<Response> {
   let body: Rpc | Rpc[];
   try { body = await req.json(); } catch { return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400); }
   if (Array.isArray(body)) {
-    const out = (await Promise.all(body.map((m) => handleRpc(m, userId)))).filter(Boolean);
+    const out = (await Promise.all(body.map((m) => handleRpc(m, userId, req)))).filter(Boolean);
     return out.length ? json(out) : new Response(null, { status: 202 });
   }
-  const out = await handleRpc(body, userId);
+  const out = await handleRpc(body, userId, req);
   return out ? json(out) : new Response(null, { status: 202 });
 }
 
@@ -103,6 +106,8 @@ async function route(req: Request): Promise<Response> {
   if (path === "/google/callback") return googleCallback(req);
   if (path === "/token" && req.method === "POST") return token(req);
   if (path === "/mcp") return mcp(req);
+  const media = /^\/ig\/media\/([A-Za-z0-9_-]+)\/(video|cover)$/.exec(path);
+  if (media && (req.method === "GET" || req.method === "HEAD")) return serveMedia(req, media[1], media[2]);
   if (path === "/" || path === "/api/index") return home(req);
   return json({ error: "not_found" }, 404);
 }
@@ -120,3 +125,4 @@ export const GET = handler;
 export const POST = handler;
 export const OPTIONS = handler;
 export const DELETE = handler;
+export const HEAD = handler;

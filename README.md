@@ -6,7 +6,8 @@ Cloud project, your API quota, your channel.
 
 What Claude can do with it: upload a video (with title, description, tags, category, privacy or a scheduled
 `publish_at`, AI-content disclosure), set a thumbnail, add captions, edit a video's metadata or schedule, list
-recent uploads, and manage playlists.
+recent uploads, and manage playlists. Optionally it can also publish Reels to your Instagram professional
+account (see [Instagram Reels](#instagram-reels-optional)).
 
 ## Set it up (about 15 minutes)
 
@@ -44,6 +45,9 @@ Fork this repository (or use it as a template) into your own GitHub account.
 | `ALLOWED_EMAILS` | strongly recommended | Your Google account email(s), comma-separated. Anyone else is refused. |
 | `PUBLIC_URL` | optional | e.g. `https://my-uploader.vercel.app` if you use a custom domain |
 | `GITHUB_TOKEN`, `MEDIA_REPO` (owner/repo), `SKETCHFAB_TOKEN` | optional | Only for the GitHub-relay and Sketchfab tools |
+| `META_ACCESS_TOKEN` | optional | Only for Instagram Reels. The Instagram tools appear only when this is set. |
+| `META_APP_ID`, `META_APP_SECRET` | optional | Lets `whoami` show when the Instagram token expires. |
+| `META_IG_USER_ID` | optional | Only if the token reaches several Instagram accounts and you want a specific one. |
 
 Check it: opening `https://tubedrop.vercel.app/` shows a short "TubeDrop" page.
 
@@ -72,6 +76,47 @@ YouTube, and `kind: "thumbnail"` / `"captions"` attach to an existing video.
 
 Uploads default to **private**. Scheduled videos use `privacy: private` plus `publish_at`; setting
 `privacy: public` on a scheduled video publishes it now.
+
+## Instagram Reels (optional)
+
+TubeDrop can also publish a Drive video as a Reel on your Instagram **Business or Creator** account, through
+the *Instagram API with Unified login* (no Facebook Page needed). It posts to one account: yours, through an
+access token you generate in Meta's dashboard. Anyone allowed to use the connector (`ALLOWED_EMAILS`) can post
+to it.
+
+### Set it up
+
+1. Switch your Instagram account to a professional account (Instagram app: Settings → Account type and tools).
+2. At <https://developers.facebook.com/apps> create an app and add the use case **Manage messaging & content on
+   Instagram**. New apps get *API setup with Unified login*; the app must belong to a business portfolio.
+3. In **Use cases → Customize → API setup with Unified login → Generate access tokens**, add your Instagram
+   account as a tester and accept the invite in the Instagram app (Settings → Website permissions → Apps and
+   websites → Tester invites). For your own account you do not need Meta's App Review.
+4. Click **Generate token** and copy it (it is shown once). Check it in the
+   [Access Token Debugger](https://developers.facebook.com/tools/debug/accesstoken): the scopes must include
+   `instagram_content_publish`; note when it expires.
+5. In Vercel set `META_ACCESS_TOKEN` to the token. Optionally also set `META_APP_ID` and `META_APP_SECRET` (App
+   settings → Basic) so `whoami` can show the token's expiry. Redeploy.
+6. Ask Claude "whoami": it should show your Instagram username.
+
+If the token has an expiry date, generate a new one before then and update `META_ACCESS_TOKEN`. When a token stops
+working, the Instagram tools say so.
+
+### How it works
+
+1. Get the video into Drive the usual way (`get_upload_url` with `kind: "drive"`).
+2. `instagram_publish_reel` with the Drive id, caption and optionally a JPEG `cover_drive_file`. Meta publishes
+   from a URL, so TubeDrop gives it a link to `/ig/media/<job>/video?t=<secret>`, which streams the Drive file.
+   Each link has its own random secret and stops working once the Reel is published or fails.
+3. Instagram processes the video; call `instagram_continue_publish` about once a minute until it says done. The
+   result has the Reel's link, and the video and cover are deleted from the Drive uploads folder.
+
+`instagram_list_media` lists recent posts and how much of the 24-hour API publishing limit is used.
+
+**A Reel is public as soon as it is published.** The API has no private or scheduled posts, so the publish tool
+requires `user_confirmed: true` and Claude is told to post only when you have clearly said so.
+
+Reel specs: MP4 or MOV, H.264 or HEVC, AAC audio, 3 seconds to 15 minutes, 9:16 recommended, at most 300 MB.
 
 ## Limits worth knowing
 

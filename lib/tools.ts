@@ -1,5 +1,6 @@
 import { accessToken, driveBytes, driveId, driveMeta, driveSearch, gfetch, gjson, ToolError } from "./google.js";
-import { db, decrypt, encrypt, env, randomId } from "./util.js";
+import { continuePublish, instagramEnabled, listMedia, publishingLimit, publishReel, whoamiInstagram } from "./instagram.js";
+import { baseUrl, db, decrypt, encrypt, env, randomId } from "./util.js";
 
 const YT = "https://www.googleapis.com/youtube/v3";
 const UPLOADS_FOLDER_NAME = "TubeDrop Uploads";
@@ -185,6 +186,47 @@ export const TOOLS = [
   },
 ];
 
+const INSTAGRAM_TOOLS = [
+  {
+    name: "instagram_publish_reel",
+    description:
+      "Publish a video from Google Drive to the owner's Instagram account (shown by whoami) as a Reel. A Reel is PUBLIC as soon as it is " +
+      "published (Instagram has no private or scheduled posts through the API), so only call this after the user has " +
+      "clearly said to post it in this conversation, and pass user_confirmed: true. Video: MP4/MOV, H.264 or HEVC, AAC " +
+      "audio, 3 s to 15 min, 9:16, at most 300 MB. To get a local file into Drive first, use get_upload_url with kind " +
+      "'drive'. Instagram takes a while to process the video: if the result says 'in_progress', wait about a minute and " +
+      "call instagram_continue_publish with the job_id. The Drive files are deleted afterwards (delete_from_drive, default true).",
+    inputSchema: {
+      type: "object",
+      required: ["drive_file", "user_confirmed"],
+      properties: {
+        drive_file: { type: "string", description: "Google Drive file ID or share link of the video." },
+        caption: { type: "string", description: "Caption, max 2,200 characters, at most 30 hashtags and 20 @mentions." },
+        cover_drive_file: { type: "string", description: "Drive ID/link of a JPEG cover image (9:16, max 8 MB). Overrides thumb_offset_ms." },
+        thumb_offset_ms: { type: "number", description: "Use the frame at this many milliseconds as the cover. Default 0." },
+        share_to_feed: { type: "boolean", description: "Also show the Reel in the profile feed grid. Default true." },
+        is_ai_generated: { type: "boolean", description: "Label the Reel as AI-generated content." },
+        collaborators: { type: "array", items: { type: "string" }, description: "Up to 3 Instagram usernames to invite as collaborators." },
+        delete_from_drive: { type: "boolean", description: "After publishing, delete the video and cover from Drive (only if they are in the connector's uploads folder). Default true." },
+        user_confirmed: { type: "boolean", description: "Must be true: the user has explicitly said to publish this Reel publicly." },
+      },
+    },
+  },
+  {
+    name: "instagram_continue_publish",
+    description: "Check on a Reel started by instagram_publish_reel and publish it once Instagram has processed the video. Call about once a minute until status is 'done'.",
+    inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" } } },
+  },
+  {
+    name: "instagram_list_media",
+    description: "List the Instagram account's most recent posts and Reels, plus how many API posts are used of the 24-hour limit.",
+    inputSchema: { type: "object", properties: { max: { type: "number", description: "Default 12, max 50." } } },
+  },
+];
+
+/** The tools this install offers; the Instagram ones only when META_ACCESS_TOKEN is set. */
+export const tools = () => (instagramEnabled() ? [...TOOLS, ...INSTAGRAM_TOOLS] : TOOLS);
+
 // ---------------------------------------------------------------- helpers
 
 type Args = Record<string, any>;
@@ -242,7 +284,7 @@ function multipartRelated(meta: unknown, body: ArrayBuffer, mime: string) {
 }
 
 /** Delete a Drive file, but only if it sits in the connector's own uploads folder. Returns a note for the result. */
-async function deleteIfOurs(dr: string, ref: string): Promise<string> {
+export async function deleteIfOurs(dr: string, ref: string): Promise<string> {
   const id = driveId(ref);
   try {
     const q = UPLOADS_FOLDER_Q;
@@ -455,6 +497,7 @@ async function pump(userId: string, jobId: string) {
   const dr = await accessToken(userId, "drive");
   let job = (await sql`SELECT * FROM jobs WHERE id = ${jobId} AND user_id = ${userId}`)[0];
   if (!job) throw new ToolError(`No upload job ${jobId}.`);
+  if (job.kind === "ig") throw new ToolError(`${jobId} is an Instagram Reel; use instagram_continue_publish.`);
   const isImport = job.kind === "import";
   if (job.status === "done") return isImport ? importSummary(job) : summary(job);
   if (job.status === "failed") throw new ToolError(`That upload failed earlier: ${job.error}`);
@@ -618,12 +661,38 @@ async function getUploadUrl(userId: string, a: Args) {
 
 // ---------------------------------------------------------------- dispatcher
 
-export async function callTool(userId: string, name: string, a: Args): Promise<unknown> {
+export async function callTool(userId: string, name: string, a: Args, req: Request): Promise<unknown> {
   const sql = await db();
+  if (name.startsWith("instagram_") && !instagramEnabled()) throw new ToolError("Instagram is not set up on this server (META_ACCESS_TOKEN is missing).");
   switch (name) {
     case "whoami": {
       const u = (await sql`SELECT email, channel_id, channel_title FROM users WHERE id = ${userId}`)[0];
-      return { google_account: u?.email, channel: u?.channel_title, channel_id: u?.channel_id, channel_url: u?.channel_id ? `https://www.youtube.com/channel/${u.channel_id}` : null };
+      const out: Args = { google_account: u?.email, channel: u?.channel_title, channel_id: u?.channel_id, channel_url: u?.channel_id ? `https://www.youtube.com/channel/${u.channel_id}` : null };
+      if (instagramEnabled()) {
+        try { out.instagram = await whoamiInstagram(); }
+        catch (e) { out.instagram = { error: (e as Error).message }; }
+      }
+      return out;
+    }
+    case "instagram_publish_reel": {
+      const dr = await accessToken(userId, "drive");
+      const file = await driveMeta(dr, driveId(a.drive_file));
+      let cover: { id: string; mimeType: string } | undefined;
+      if (a.cover_drive_file) {
+        const c = await driveMeta(dr, driveId(a.cover_drive_file));
+        if (c.mimeType !== "image/jpeg") throw new ToolError(`${c.name} is ${c.mimeType}; Instagram covers must be JPEG.`);
+        if (Number(c.size ?? 0) > 8 * 1024 * 1024) throw new ToolError(`${c.name} is over Instagram's 8 MB cover limit.`);
+        cover = { id: c.id, mimeType: c.mimeType };
+      }
+      return publishReel(baseUrl(req), userId, a, file, cover);
+    }
+    case "instagram_continue_publish":
+      return continuePublish(userId, a.job_id);
+    case "instagram_list_media": {
+      const media = await listMedia(a.max ?? 12);
+      let limit: Args | null = null;
+      try { limit = await publishingLimit(); } catch { /* optional */ }
+      return { publishing_limit: limit, items: media };
     }
     case "find_drive_files": {
       const token = await accessToken(userId, "drive");

@@ -80,8 +80,7 @@ async function migrate(s: any) {
     await s`ALTER TABLE users ADD COLUMN IF NOT EXISTS yt_refresh_enc text`;
     await s`ALTER TABLE users ADD COLUMN IF NOT EXISTS yt_access_enc text`;
     await s`ALTER TABLE users ADD COLUMN IF NOT EXISTS yt_expiry timestamptz`;
-    await s`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS kind text`;
-  }
+    await s`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS kind text`;  }
 }
 
 // ---------------------------------------------------------------- http

@@ -13,9 +13,10 @@ const execFileP = promisify(execFile);
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 
-const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "uploader-e2e-"));
 fs.mkdirSync(TMP, { recursive: true });
 
@@ -23,6 +24,8 @@ process.env.ENC_KEY = randomBytes(32).toString("base64");
 process.env.GOOGLE_CLIENT_ID = "test-client";
 process.env.GOOGLE_CLIENT_SECRET = "test-secret";
 process.env.PUBLIC_URL = "https://uploader.test";
+process.env.IG_POLL_SECONDS = "0";                  // one Instagram status check per call
+delete process.env.META_ACCESS_TOKEN;                // Instagram is switched on later in the test
 
 // ------------------------------------------------------------------ in-process Postgres behind the neon() interface
 const pg = new PGlite();
@@ -166,18 +169,61 @@ const server = http.createServer(async (req, res) => {
 await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
 PORT = (server.address() as any).port;
 
-// Route the server's Google calls to the fake.
+// ------------------------------------------------------------------ fake Meta (Instagram API with Unified login, graph.facebook.com)
+const IG_ID = "17840000000000001";
+type Container = { body: any; video: Buffer; cover?: Buffer; polls: number };
+const igContainers = new Map<string, Container>();
+const igPosts: { id: string; caption: string; permalink: string }[] = [];
+let serverGET: (r: Request) => Promise<Response>;
+const igReply = (obj: any, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
+async function fakeMeta(url: string, init: any = {}): Promise<Response> {
+  const u = new URL(url);
+  const method = init.method ?? "GET";
+  const bearer = new Headers(init.headers).get("authorization") ?? "";
+  const p = u.pathname.replace(/^\/v[\d.]+/, "");
+  if (p === "/debug_token") {
+    if (u.searchParams.get("access_token") !== "meta-app|meta-secret") return igReply({ error: { message: "Invalid app token" } }, 400);
+    return igReply({ data: { is_valid: u.searchParams.get("input_token") === "meta-token", expires_at: 0 } });
+  }
+  if (bearer !== "Bearer meta-token") return igReply({ error: { message: "Invalid OAuth access token", code: 190 } }, 401);
+  if (p === "/me/assigned_instagram_accounts") return igReply({ data: [{ id: IG_ID, username: "dubious.archive" }] });
+  if (p === `/${IG_ID}/media` && method === "POST") {
+    const body = JSON.parse(init.body);
+    const grab = async (src: string) => { const r = await serverGET(new Request(src)); if (r.status !== 200) throw new Error(`media fetch ${r.status}`); return Buffer.from(await r.arrayBuffer()); };
+    try {
+      const c: Container = { body, video: await grab(body.video_url), cover: body.cover_url ? await grab(body.cover_url) : undefined, polls: 0 };
+      const cid = id("cont_"); igContainers.set(cid, c); return igReply({ id: cid });
+    } catch (e) { return igReply({ error: { message: `Media download failed: ${(e as Error).message}` } }, 400); }
+  }
+  if (p === `/${IG_ID}/media` && method === "GET") return igReply({ data: igPosts.map((m) => ({ id: m.id, caption: m.caption, media_type: "VIDEO", media_product_type: "REELS", permalink: m.permalink, timestamp: "2026-10-31T00:00:00+0000" })) });
+  if (p === `/${IG_ID}/media_publish`) {
+    const c = igContainers.get(JSON.parse(init.body).creation_id);
+    if (!c || c.polls < 2) return igReply({ error: { message: "Media ID is not available" } }, 400);
+    const post = { id: id("m_"), caption: c.body.caption, permalink: `https://www.instagram.com/reel/${randomBytes(4).toString("hex")}/` };
+    igPosts.push(post); return igReply({ id: post.id });
+  }
+  if (p === `/${IG_ID}/content_publishing_limit`) return igReply({ data: [{ quota_usage: igPosts.length, config: { quota_total: 50, quota_duration: 86400 } }] });
+  const c = igContainers.get(p.slice(1));
+  if (c) { c.polls++; return igReply({ id: p.slice(1), status_code: c.polls >= 2 ? "FINISHED" : "IN_PROGRESS" }); }
+  const post = igPosts.find((m) => m.id === p.slice(1));
+  if (post) return igReply({ id: post.id, permalink: post.permalink });
+  return igReply({ error: { message: `fake meta: no route ${method} ${p}` } }, 404);
+}
+
+// Route the server's Google and Meta calls to the fakes.
 const realFetch = globalThis.fetch;
 globalThis.fetch = (input: any, init?: any) => {
   let url = typeof input === "string" ? input : input.url;
+  if (url.startsWith("https://graph.facebook.com/")) return fakeMeta(url, init);
   url = url.replace("https://www.googleapis.com", `http://127.0.0.1:${PORT}`);
   if (url.startsWith("https://oauth2.googleapis.com")) return Promise.resolve(new Response(JSON.stringify({ access_token: "fresh", expires_in: 3600 }), { status: 200 }));
   return realFetch(url, init);
 };
 
 // ------------------------------------------------------------------ the server under test
-const { POST } = await import(`${ROOT}/api/index.ts`);
-const { db, encrypt, sha256 } = await import(`${ROOT}/lib/util.ts`);
+const { POST, GET } = await import(pathToFileURL(`${ROOT}/api/index.ts`).href);
+const { db, encrypt, sha256 } = await import(pathToFileURL(`${ROOT}/lib/util.ts`).href);
+serverGET = GET;
 const sql = await db();
 const exp = new Date(Date.now() + 3600e3).toISOString();
 await sql`INSERT INTO users (id, email, channel_id, channel_title, google_refresh_enc, google_access_enc, google_expiry, yt_refresh_enc, yt_access_enc, yt_expiry)
@@ -214,6 +260,7 @@ const check = (name: string, ok: boolean, info = "") => { results.push([name, ok
     body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) }));
   const names = (await r2.json()).result.tools.map((t: any) => t.name);
   check("tools/list includes get_upload_url and upload_video", names.includes("get_upload_url") && names.includes("upload_video"), names.join(","));
+  check("no Instagram tools without META_ACCESS_TOKEN",!names.some((n: string) => n.startsWith("instagram_")));
 }
 
 // ------------------------------------------------------------------ 1. local files -> Drive (direct, via upload.sh)
@@ -285,6 +332,53 @@ check("direct thumbnail upload", sha(thumbs.get(direct.id)!) === sha(th));
 let refused = false;
 try { await call("get_upload_url", { kind: "thumbnail", size_bytes: 3 * 1024 * 1024, video_id: direct.id }); } catch { refused = true; }
 check("oversized thumbnail refused before upload", refused);
+
+// ------------------------------------------------------------------ 8. Instagram: switch on with a token
+const refusedCall = async (name: string, args: any) => { try { await call(name, args); return ""; } catch (e) { return (e as Error).message; } };
+check("Instagram tools refuse to run without META_ACCESS_TOKEN", (await refusedCall("instagram_list_media", {})).includes("META_ACCESS_TOKEN"));
+process.env.META_ACCESS_TOKEN = "meta-token";
+process.env.META_APP_ID = "meta-app";
+process.env.META_APP_SECRET = "meta-secret";
+{
+  const r2: Response = await POST(new Request("https://uploader.test/mcp", { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer at_test" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "tools/list" }) }));
+  const names = (await r2.json()).result.tools.map((t: any) => t.name);
+  check("Instagram tools listed once META_ACCESS_TOKEN is set", ["instagram_publish_reel", "instagram_continue_publish", "instagram_list_media"].every((n) => names.includes(n)));
+}
+const who = await call("whoami");
+check("whoami finds the Instagram account and token expiry", who.instagram?.username === "dubious.archive" && who.instagram?.token_expires === "never", JSON.stringify(who.instagram));
+
+// ------------------------------------------------------------------ 9. Instagram: publish a Reel from Drive
+const reelPath = path.join(TMP, "reel.mp4"); const reel = randomBytes(3 * 1024 * 1024 + 77); fs.writeFileSync(reelPath, reel);
+const coverPath = path.join(TMP, "cover.jpg"); const cov = randomBytes(90 * 1024); fs.writeFileSync(coverPath, cov);
+const dReel = await toDrive(reelPath, "video/mp4");
+const dCover = await toDrive(coverPath, "image/jpeg");
+check("publishing without user_confirmed is refused", (await refusedCall("instagram_publish_reel", { drive_file: dReel.id, caption: "x" })).includes("user_confirmed"));
+check("caption over 2,200 characters is refused", (await refusedCall("instagram_publish_reel", { drive_file: dReel.id, caption: "a".repeat(2201), user_confirmed: true })).includes("2,200"));
+check("an image is not accepted as the Reel video", (await refusedCall("instagram_publish_reel", { drive_file: dCover.id, user_confirmed: true })).includes("MP4 or MOV"));
+let reelJob = await call("instagram_publish_reel", { drive_file: dReel.id, caption: "The night the sky fell #history", cover_drive_file: dCover.id, is_ai_generated: true, user_confirmed: true });
+const container = [...igContainers.values()].at(-1)!;
+check("Meta received the exact video bytes from the media route", !!container && sha(container.video) === sha(reel) && container.body.video_url.startsWith("https://uploader.test/ig/media/"));
+check("Meta received the cover and Reel settings", !!container?.cover && sha(container.cover) === sha(cov) && container.body.media_type === "REELS" &&
+  container.body.share_to_feed === true && container.body.is_ai_generated === true && container.body.caption.includes("#history"));
+check("Reel waits while Instagram processes", reelJob.status === "in_progress", JSON.stringify(reelJob));
+const badSecret: Response = await GET(new Request(container.body.video_url.replace(/t=[^&]+/, "t=wrong")));
+check("media route refuses a wrong secret", badSecret.status === 404);
+const ranged: Response = await GET(new Request(container.body.video_url, { headers: { range: "bytes=0-99" } }));
+check("media route honours Range requests", ranged.status === 206 && (await ranged.arrayBuffer()).byteLength === 100);
+check("continue_upload refuses an Instagram job", (await refusedCall("continue_upload", { job_id: reelJob.job_id })).includes("instagram_continue_publish"));
+let igCalls = 1;
+while (reelJob.status === "in_progress" && igCalls < 10) { reelJob = await call("instagram_continue_publish", { job_id: reelJob.job_id }); igCalls++; }
+check("Reel published with a permalink", reelJob.status === "done" && igPosts.length === 1 && reelJob.url === igPosts[0].permalink, `${igCalls} call(s)`);
+check("Reel video and cover deleted from Drive", !drive.has(dReel.id) && !drive.has(dCover.id), (reelJob.extras ?? []).join(" | "));
+const afterDone: Response = await GET(new Request(container.body.video_url));
+check("media route stops serving once published", afterDone.status === 404);
+
+// ------------------------------------------------------------------ 10. Instagram: listing and a revoked token
+const listed = await call("instagram_list_media");
+check("list_media returns the Reel and the publishing limit", listed.items.length === 1 && listed.items[0].type === "REELS" && listed.publishing_limit?.limit === 50, JSON.stringify(listed.publishing_limit));
+process.env.META_ACCESS_TOKEN = "revoked-token";
+check("a revoked token gives a clear fix", (await refusedCall("instagram_list_media", {})).includes("update META_ACCESS_TOKEN"));
 
 const failed = results.filter((r) => !r[1]);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
