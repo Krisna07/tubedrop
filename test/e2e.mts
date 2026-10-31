@@ -25,7 +25,7 @@ process.env.GOOGLE_CLIENT_ID = "test-client";
 process.env.GOOGLE_CLIENT_SECRET = "test-secret";
 process.env.PUBLIC_URL = "https://uploader.test";
 process.env.IG_POLL_SECONDS = "0";                  // one Instagram status check per call
-delete process.env.INSTAGRAM_APP_ID;                 // Instagram is switched on later in the test
+delete process.env.META_ACCESS_TOKEN;                // Instagram is switched on later in the test
 
 // ------------------------------------------------------------------ in-process Postgres behind the neon() interface
 const pg = new PGlite();
@@ -169,28 +169,24 @@ const server = http.createServer(async (req, res) => {
 await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
 PORT = (server.address() as any).port;
 
-// ------------------------------------------------------------------ fake Meta (Instagram API with Instagram Login)
+// ------------------------------------------------------------------ fake Meta (Instagram API with Unified login, graph.facebook.com)
 const IG_ID = "17840000000000001";
 type Container = { body: any; video: Buffer; cover?: Buffer; polls: number };
 const igContainers = new Map<string, Container>();
 const igPosts: { id: string; caption: string; permalink: string }[] = [];
-let igRefreshes = 0;
 let serverGET: (r: Request) => Promise<Response>;
 const igReply = (obj: any, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "content-type": "application/json" } });
 async function fakeMeta(url: string, init: any = {}): Promise<Response> {
   const u = new URL(url);
   const method = init.method ?? "GET";
   const bearer = new Headers(init.headers).get("authorization") ?? "";
-  if (u.host === "api.instagram.com" && u.pathname === "/oauth/access_token") {
-    const f = new URLSearchParams(String(init.body));
-    if (f.get("code") !== "good-code" || f.get("client_secret") !== "ig-secret") return igReply({ error_type: "OAuthException", code: 400, error_message: "Matching code was not found" }, 400);
-    return igReply({ data: [{ access_token: "ig-short", user_id: IG_ID, permissions: "instagram_business_basic,instagram_business_content_publish" }] });
-  }
-  if (u.pathname === "/access_token") return igReply({ access_token: "ig-long-1", token_type: "bearer", expires_in: 5184000 });
-  if (u.pathname === "/refresh_access_token") { igRefreshes++; return igReply({ access_token: "ig-long-2", token_type: "bearer", expires_in: 5184000 }); }
-  if (!bearer.startsWith("Bearer ig-long")) return igReply({ error: { message: "Invalid OAuth access token" } }, 401);
   const p = u.pathname.replace(/^\/v[\d.]+/, "");
-  if (p === "/me") return igReply({ data: [{ user_id: IG_ID, username: "dubious.archive" }] });
+  if (p === "/debug_token") {
+    if (u.searchParams.get("access_token") !== "meta-app|meta-secret") return igReply({ error: { message: "Invalid app token" } }, 400);
+    return igReply({ data: { is_valid: u.searchParams.get("input_token") === "meta-token", expires_at: 0 } });
+  }
+  if (bearer !== "Bearer meta-token") return igReply({ error: { message: "Invalid OAuth access token", code: 190 } }, 401);
+  if (p === "/me/assigned_instagram_accounts") return igReply({ data: [{ id: IG_ID, username: "dubious.archive" }] });
   if (p === `/${IG_ID}/media` && method === "POST") {
     const body = JSON.parse(init.body);
     const grab = async (src: string) => { const r = await serverGET(new Request(src)); if (r.status !== 200) throw new Error(`media fetch ${r.status}`); return Buffer.from(await r.arrayBuffer()); };
@@ -218,7 +214,7 @@ async function fakeMeta(url: string, init: any = {}): Promise<Response> {
 const realFetch = globalThis.fetch;
 globalThis.fetch = (input: any, init?: any) => {
   let url = typeof input === "string" ? input : input.url;
-  if (/^https:\/\/(graph|api)\.instagram\.com\//.test(url)) return fakeMeta(url, init);
+  if (url.startsWith("https://graph.facebook.com/")) return fakeMeta(url, init);
   url = url.replace("https://www.googleapis.com", `http://127.0.0.1:${PORT}`);
   if (url.startsWith("https://oauth2.googleapis.com")) return Promise.resolve(new Response(JSON.stringify({ access_token: "fresh", expires_in: 3600 }), { status: 200 }));
   return realFetch(url, init);
@@ -264,7 +260,7 @@ const check = (name: string, ok: boolean, info = "") => { results.push([name, ok
     body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }) }));
   const names = (await r2.json()).result.tools.map((t: any) => t.name);
   check("tools/list includes get_upload_url and upload_video", names.includes("get_upload_url") && names.includes("upload_video"), names.join(","));
-  check("no Instagram tools without INSTAGRAM_APP_ID", !names.some((n: string) => n.startsWith("instagram_")));
+  check("no Instagram tools without META_ACCESS_TOKEN",!names.some((n: string) => n.startsWith("instagram_")));
 }
 
 // ------------------------------------------------------------------ 1. local files -> Drive (direct, via upload.sh)
@@ -337,29 +333,20 @@ let refused = false;
 try { await call("get_upload_url", { kind: "thumbnail", size_bytes: 3 * 1024 * 1024, video_id: direct.id }); } catch { refused = true; }
 check("oversized thumbnail refused before upload", refused);
 
-// ------------------------------------------------------------------ 8. Instagram: link the account
-process.env.INSTAGRAM_APP_ID = "ig-app";
-process.env.INSTAGRAM_APP_SECRET = "ig-secret";
+// ------------------------------------------------------------------ 8. Instagram: switch on with a token
 const refusedCall = async (name: string, args: any) => { try { await call(name, args); return ""; } catch (e) { return (e as Error).message; } };
+check("Instagram tools refuse to run without META_ACCESS_TOKEN", (await refusedCall("instagram_list_media", {})).includes("META_ACCESS_TOKEN"));
+process.env.META_ACCESS_TOKEN = "meta-token";
+process.env.META_APP_ID = "meta-app";
+process.env.META_APP_SECRET = "meta-secret";
 {
   const r2: Response = await POST(new Request("https://uploader.test/mcp", { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer at_test" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 99, method: "tools/list" }) }));
   const names = (await r2.json()).result.tools.map((t: any) => t.name);
-  check("Instagram tools listed once INSTAGRAM_APP_ID is set", ["instagram_connect", "instagram_publish_reel", "instagram_continue_publish", "instagram_list_media"].every((n) => names.includes(n)));
+  check("Instagram tools listed once META_ACCESS_TOKEN is set", ["instagram_publish_reel", "instagram_continue_publish", "instagram_list_media"].every((n) => names.includes(n)));
 }
-check("whoami shows no Instagram account before linking", (await call("whoami")).instagram === null);
-const conn = await call("instagram_connect");
-const start: Response = await GET(new Request(conn.link));
-const authUrl = new URL(start.headers.get("location") ?? "https://x/");
-check("connect link redirects to Instagram sign-in with publish scope",
-  start.status === 302 && authUrl.host === "www.instagram.com" && authUrl.searchParams.get("scope")!.includes("instagram_business_content_publish") &&
-  authUrl.searchParams.get("redirect_uri") === "https://uploader.test/instagram/callback");
-const cb: Response = await GET(new Request(`https://uploader.test/instagram/callback?code=good-code&state=${authUrl.searchParams.get("state")}`));
-check("Instagram callback stores the account", cb.status === 200 && (await call("whoami")).instagram?.username === "dubious.archive");
-const again: Response = await GET(new Request(`https://uploader.test/instagram/callback?code=good-code&state=${authUrl.searchParams.get("state")}`));
-check("connect link only works once", again.status === 400);
-const stored = (await sql`SELECT token_enc FROM instagram_accounts WHERE user_id = 'u1'`)[0];
-check("Instagram token is stored encrypted", !!stored && !String(stored.token_enc).includes("ig-long"));
+const who = await call("whoami");
+check("whoami finds the Instagram account and token expiry", who.instagram?.username === "dubious.archive" && who.instagram?.token_expires === "never", JSON.stringify(who.instagram));
 
 // ------------------------------------------------------------------ 9. Instagram: publish a Reel from Drive
 const reelPath = path.join(TMP, "reel.mp4"); const reel = randomBytes(3 * 1024 * 1024 + 77); fs.writeFileSync(reelPath, reel);
@@ -387,13 +374,11 @@ check("Reel video and cover deleted from Drive", !drive.has(dReel.id) && !drive.
 const afterDone: Response = await GET(new Request(container.body.video_url));
 check("media route stops serving once published", afterDone.status === 404);
 
-// ------------------------------------------------------------------ 10. Instagram: token refresh and listing
-await sql`UPDATE instagram_accounts SET refreshed_at = now() - interval '2 days' WHERE user_id = 'u1'`;
+// ------------------------------------------------------------------ 10. Instagram: listing and a revoked token
 const listed = await call("instagram_list_media");
-check("token older than a day is refreshed", igRefreshes === 1);
 check("list_media returns the Reel and the publishing limit", listed.items.length === 1 && listed.items[0].type === "REELS" && listed.publishing_limit?.limit === 50, JSON.stringify(listed.publishing_limit));
-await call("instagram_list_media");
-check("fresh token is not refreshed again", igRefreshes === 1);
+process.env.META_ACCESS_TOKEN = "revoked-token";
+check("a revoked token gives a clear fix", (await refusedCall("instagram_list_media", {})).includes("update META_ACCESS_TOKEN"));
 
 const failed = results.filter((r) => !r[1]);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);

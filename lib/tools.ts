@@ -1,5 +1,5 @@
 import { accessToken, driveBytes, driveId, driveMeta, driveSearch, gfetch, gjson, ToolError } from "./google.js";
-import { connectLink, continuePublish, igAccount, instagramEnabled, listMedia, publishingLimit, publishReel } from "./instagram.js";
+import { continuePublish, instagramEnabled, listMedia, publishingLimit, publishReel, whoamiInstagram } from "./instagram.js";
 import { baseUrl, db, decrypt, encrypt, env, randomId } from "./util.js";
 
 const YT = "https://www.googleapis.com/youtube/v3";
@@ -188,16 +188,9 @@ export const TOOLS = [
 
 const INSTAGRAM_TOOLS = [
   {
-    name: "instagram_connect",
-    description:
-      "Link an Instagram professional (Business or Creator) account. Returns a one-time link (valid 30 minutes) for the " +
-      "user to open in a browser and sign in with Instagram. Only needed once, or when the sign-in has expired.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
     name: "instagram_publish_reel",
     description:
-      "Publish a video from Google Drive to the linked Instagram account as a Reel. A Reel is PUBLIC as soon as it is " +
+      "Publish a video from Google Drive to the owner's Instagram account (shown by whoami) as a Reel. A Reel is PUBLIC as soon as it is " +
       "published (Instagram has no private or scheduled posts through the API), so only call this after the user has " +
       "clearly said to post it in this conversation, and pass user_confirmed: true. Video: MP4/MOV, H.264 or HEVC, AAC " +
       "audio, 3 s to 15 min, 9:16, at most 300 MB. To get a local file into Drive first, use get_upload_url with kind " +
@@ -226,12 +219,12 @@ const INSTAGRAM_TOOLS = [
   },
   {
     name: "instagram_list_media",
-    description: "List the linked Instagram account's most recent posts and Reels, plus how many API posts are left in the 24-hour limit.",
+    description: "List the Instagram account's most recent posts and Reels, plus how many API posts are used of the 24-hour limit.",
     inputSchema: { type: "object", properties: { max: { type: "number", description: "Default 12, max 50." } } },
   },
 ];
 
-/** The tools this install offers; the Instagram ones only when INSTAGRAM_APP_ID is set. */
+/** The tools this install offers; the Instagram ones only when META_ACCESS_TOKEN is set. */
 export const tools = () => (instagramEnabled() ? [...TOOLS, ...INSTAGRAM_TOOLS] : TOOLS);
 
 // ---------------------------------------------------------------- helpers
@@ -670,19 +663,17 @@ async function getUploadUrl(userId: string, a: Args) {
 
 export async function callTool(userId: string, name: string, a: Args, req: Request): Promise<unknown> {
   const sql = await db();
-  if (name.startsWith("instagram_") && !instagramEnabled()) throw new ToolError("Instagram is not set up on this server (INSTAGRAM_APP_ID is missing).");
+  if (name.startsWith("instagram_") && !instagramEnabled()) throw new ToolError("Instagram is not set up on this server (META_ACCESS_TOKEN is missing).");
   switch (name) {
     case "whoami": {
       const u = (await sql`SELECT email, channel_id, channel_title FROM users WHERE id = ${userId}`)[0];
       const out: Args = { google_account: u?.email, channel: u?.channel_title, channel_id: u?.channel_id, channel_url: u?.channel_id ? `https://www.youtube.com/channel/${u.channel_id}` : null };
       if (instagramEnabled()) {
-        const ig = await igAccount(userId);
-        out.instagram = ig ? { username: ig.username, profile_url: ig.username ? `https://www.instagram.com/${ig.username}/` : null, signed_in_until: ig.token_expiry } : null;
+        try { out.instagram = await whoamiInstagram(); }
+        catch (e) { out.instagram = { error: (e as Error).message }; }
       }
       return out;
     }
-    case "instagram_connect":
-      return { link: await connectLink(req, userId), expires_in_minutes: 30, next: "Ask the user to open the link, sign in with Instagram and allow access, then call whoami to check." };
     case "instagram_publish_reel": {
       const dr = await accessToken(userId, "drive");
       const file = await driveMeta(dr, driveId(a.drive_file));
@@ -698,9 +689,9 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
     case "instagram_continue_publish":
       return continuePublish(userId, a.job_id);
     case "instagram_list_media": {
-      const media = await listMedia(userId, a.max ?? 12);
+      const media = await listMedia(a.max ?? 12);
       let limit: Args | null = null;
-      try { limit = await publishingLimit(userId); } catch { /* optional */ }
+      try { limit = await publishingLimit(); } catch { /* optional */ }
       return { publishing_limit: limit, items: media };
     }
     case "find_drive_files": {

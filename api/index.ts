@@ -4,7 +4,7 @@
  */
 import { authenticate, authorize, authServerMetadata, googleCallback, protectedResourceMetadata, register, token } from "../lib/oauth.js";
 import { ToolError } from "../lib/google.js";
-import { connectCallback, connectStart, serveMedia } from "../lib/instagram.js";
+import { serveMedia } from "../lib/instagram.js";
 import { callTool, tools } from "../lib/tools.js";
 import { baseUrl, html, json } from "../lib/util.js";
 
@@ -106,8 +106,6 @@ async function route(req: Request): Promise<Response> {
   if (path === "/google/callback") return googleCallback(req);
   if (path === "/token" && req.method === "POST") return token(req);
   if (path === "/mcp") return mcp(req);
-  if (path === "/instagram/connect") return connectStart(req);
-  if (path === "/instagram/callback") return connectCallback(req);
   const media = /^\/ig\/media\/([A-Za-z0-9_-]+)\/(video|cover)$/.exec(path);
   if (media && (req.method === "GET" || req.method === "HEAD")) return serveMedia(req, media[1], media[2]);
   if (path === "/" || path === "/api/index") return home(req);
