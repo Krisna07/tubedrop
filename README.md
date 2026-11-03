@@ -14,7 +14,8 @@ account (see [Instagram Reels](#instagram-reels-optional)).
 ### 1. Google Cloud project
 
 1. Go to <https://console.cloud.google.com/> and create a project.
-2. **APIs & Services → Library**: enable **YouTube Data API v3** and **Google Drive API**.
+2. **APIs & Services → Library**: enable **YouTube Data API v3**, **Google Drive API** and **YouTube Analytics API**
+   (the last one is only needed for the `get_analytics` tool).
 3. **Google Auth Platform → Branding**: app name (anything), your email as support and developer contact.
 4. **Audience**: user type **External**. Add your own Google account under **Test users**.
    - Testing mode signs you out every 7 days. To avoid that, press **Publish app** ("In production").
@@ -117,6 +118,15 @@ working, the Instagram tools say so.
 requires `user_confirmed: true` and Claude is told to post only when you have clearly said so.
 
 Reel specs: MP4 or MOV, H.264 or HEVC, AAC audio, 3 seconds to 15 minutes, 9:16 recommended, at most 300 MB.
+
+## Stats and analytics
+
+- `get_video_stats`: lifetime views, likes and comments per video (YouTube Data API, no extra permission).
+- `get_analytics`: owner-only YouTube Studio data from the YouTube Analytics API. Reports: `videos` (views, watch time,
+  average view duration and % viewed, likes, comments, shares, subscribers gained per video), `daily`, `traffic_sources`
+  and `retention` (one video's audience retention curve). It needs the YouTube Analytics API enabled and the
+  "View YouTube Analytics reports" permission, which the YouTube sign-in now asks for. If you connected before this
+  was added, disconnect and reconnect once. Analytics data lags about two days.
 
 ## Limits worth knowing
 

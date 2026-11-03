@@ -184,6 +184,40 @@ export const TOOLS = [
       properties: { title: { type: "string" }, description: { type: "string" }, privacy: { type: "string", enum: ["private", "unlisted", "public"] } },
     },
   },
+  {
+    name: "get_video_stats",
+    description:
+      "Public counters for the channel's videos: views, likes and comments, with publish date, privacy, length and whether it is a Short. " +
+      "Pass video_ids, or leave them out for the most recent uploads. Counts are lifetime totals and update within minutes. " +
+      "For watch time, retention, traffic sources and subscribers gained, use get_analytics.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        video_ids: { type: "array", items: { type: "string" }, description: "Up to 50 video ids. Default: the most recent uploads." },
+        max: { type: "number", description: "How many recent uploads when video_ids is left out. Default 25, max 50." },
+      },
+    },
+  },
+  {
+    name: "get_analytics",
+    description:
+      "YouTube Analytics for the channel (owner-only data from YouTube Studio). report: " +
+      "'videos' ranks videos by views with watch time, average view duration, average % viewed, likes, comments, shares and subscribers gained; " +
+      "'daily' gives views, watch time and subscribers per day; 'traffic_sources' shows where views came from (Shorts feed, search, browse, suggested...); " +
+      "'retention' gives the audience retention curve of one video (needs video_id; audience_watch_ratio per point in the video). " +
+      "Dates are YYYY-MM-DD; the default range is the last 28 days. Analytics lags about 2 days behind; brand-new videos may show nothing yet. " +
+      "Needs the YouTube Analytics API enabled in the Google Cloud project and the connector reconnected once after this tool was added.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        report: { type: "string", enum: ["videos", "daily", "traffic_sources", "retention"], description: "Default 'videos'." },
+        start_date: { type: "string", description: "YYYY-MM-DD. Default 28 days ago." },
+        end_date: { type: "string", description: "YYYY-MM-DD. Default today." },
+        video_id: { type: "string", description: "Limit 'daily' or 'traffic_sources' to one video; required for 'retention'." },
+        max: { type: "number", description: "Rows for 'videos'. Default 50, max 200." },
+      },
+    },
+  },
 ];
 
 const INSTAGRAM_TOOLS = [
@@ -661,6 +695,129 @@ async function getUploadUrl(userId: string, a: Args) {
 
 // ---------------------------------------------------------------- dispatcher
 
+// ---------------------------------------------------------------- stats and analytics
+
+const YTA = "https://youtubeanalytics.googleapis.com/v2/reports";
+
+/** ISO 8601 duration (PT1M5S) to seconds. */
+function durationSeconds(d?: string): number | null {
+  const m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(d ?? "");
+  if (!m) return null;
+  return (+(m[1] ?? 0)) * 86400 + (+(m[2] ?? 0)) * 3600 + (+(m[3] ?? 0)) * 60 + (+(m[4] ?? 0));
+}
+
+async function recentUploadIds(token: string, max: number): Promise<string[]> {
+  const ch = await gjson<{ items: Args[] }>(token, `${YT}/channels?part=contentDetails&mine=true`);
+  const uploads = ch.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
+  if (!uploads) return [];
+  const pl = await gjson<{ items: Args[] }>(token, `${YT}/playlistItems?part=contentDetails&maxResults=${max}&playlistId=${uploads}`);
+  return (pl.items ?? []).map((i) => i.contentDetails.videoId);
+}
+
+async function videoDetails(token: string, ids: string[]): Promise<Map<string, Args>> {
+  const out = new Map<string, Args>();
+  for (let i = 0; i < ids.length; i += 50) {
+    const chunk = ids.slice(i, i + 50).join(",");
+    const r = await gjson<{ items: Args[] }>(token, `${YT}/videos?part=snippet,status,statistics,contentDetails&id=${chunk}`);
+    for (const v of r.items ?? []) out.set(v.id, v);
+  }
+  return out;
+}
+
+function statsRow(v: Args) {
+  const secs = durationSeconds(v.contentDetails?.duration);
+  const title: string = v.snippet?.title ?? "";
+  const num = (x: unknown) => (x === undefined ? null : Number(x));
+  return {
+    video_id: v.id, title, published_at: v.snippet?.publishedAt ?? null, privacy: v.status?.privacyStatus ?? null,
+    duration_seconds: secs, is_short: (secs !== null && secs <= 180) || /#shorts/i.test(title),
+    views: num(v.statistics?.viewCount), likes: num(v.statistics?.likeCount), comments: num(v.statistics?.commentCount),
+    url: watchUrl(v.id),
+  };
+}
+
+const ymd = (d: Date) => d.toISOString().slice(0, 10);
+function dateArg(v: unknown, fallback: string, name: string): string {
+  if (v === undefined || v === null || v === "") return fallback;
+  const s = String(v);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s) || isNaN(new Date(s).getTime())) throw new ToolError(`${name} must be a date like 2026-10-01.`);
+  return s;
+}
+
+/** Call the YouTube Analytics API, turning its two common setup errors into fixes the owner can act on. */
+async function analyticsQuery(token: string, params: Record<string, string>): Promise<{ columns: string[]; rows: unknown[][] }> {
+  const u = new URL(YTA);
+  u.searchParams.set("ids", "channel==MINE");
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+  const r = await gfetch(token, u.toString());
+  const text = await r.text();
+  let body: any = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  if (!r.ok) {
+    const msg: string = body?.error?.message ?? text.slice(0, 300);
+    const reasons = JSON.stringify(body?.error ?? "");
+    if (/insufficient|ACCESS_TOKEN_SCOPE_INSUFFICIENT/i.test(reasons + msg) && !/has not been used|disabled|SERVICE_DISABLED|accessNotConfigured/i.test(reasons + msg)) {
+      throw new ToolError("The connector does not have permission to read YouTube Analytics yet. Disconnect and reconnect TubeDrop in Claude's settings, and on the YouTube screen allow \"View YouTube Analytics reports\".");
+    }
+    if (/has not been used|disabled|SERVICE_DISABLED|accessNotConfigured/i.test(reasons + msg)) {
+      throw new ToolError("The YouTube Analytics API is not enabled in this connector's Google Cloud project. Enable \"YouTube Analytics API\" in Google Cloud Console (APIs & Services → Library), wait a minute, then try again.");
+    }
+    throw new ToolError(`YouTube Analytics error ${r.status}: ${msg}`);
+  }
+  return { columns: (body?.columnHeaders ?? []).map((c: Args) => c.name), rows: body?.rows ?? [] };
+}
+
+const asObjects = (q: { columns: string[]; rows: unknown[][] }) =>
+  q.rows.map((row) => Object.fromEntries(q.columns.map((c, i) => [c.replace(/[A-Z]/g, (m) => "_" + m.toLowerCase()), row[i]])));
+
+async function getAnalytics(token: string, a: Args) {
+  const report = String(a.report ?? "videos");
+  const today = new Date();
+  const end = dateArg(a.end_date, ymd(today), "end_date");
+  const start = dateArg(a.start_date, ymd(new Date(today.getTime() - 28 * 86400e3)), "start_date");
+  if (start > end) throw new ToolError("start_date must be on or before end_date.");
+  const base = { startDate: start, endDate: end };
+  const videoFilter: Record<string, string> = a.video_id ? { filters: `video==${String(a.video_id)}` } : {};
+  switch (report) {
+    case "videos": {
+      const max = Math.min(200, Math.max(1, Number(a.max ?? 50)));
+      const q = await analyticsQuery(token, {
+        ...base, dimensions: "video", sort: "-views", maxResults: String(max),
+        metrics: "views,estimatedMinutesWatched,averageViewDuration,averageViewPercentage,likes,comments,shares,subscribersGained",
+      });
+      const rows = asObjects(q);
+      const details = await videoDetails(token, rows.map((r) => String(r.video)));
+      return {
+        report, start_date: start, end_date: end,
+        rows: rows.map((r) => {
+          const v = details.get(String(r.video));
+          const meta = v ? statsRow(v) : null;
+          const { video, ...m } = r;
+          return { video_id: video, title: meta?.title ?? null, is_short: meta?.is_short ?? null, duration_seconds: meta?.duration_seconds ?? null, ...m };
+        }),
+      };
+    }
+    case "daily": {
+      const q = await analyticsQuery(token, { ...base, ...videoFilter, dimensions: "day", sort: "day", metrics: "views,estimatedMinutesWatched,subscribersGained,subscribersLost" });
+      return { report, start_date: start, end_date: end, video_id: a.video_id ?? null, rows: asObjects(q) };
+    }
+    case "traffic_sources": {
+      const q = await analyticsQuery(token, { ...base, ...videoFilter, dimensions: "insightTrafficSourceType", sort: "-views", metrics: "views,estimatedMinutesWatched" });
+      return { report, start_date: start, end_date: end, video_id: a.video_id ?? null, rows: asObjects(q) };
+    }
+    case "retention": {
+      if (!a.video_id) throw new ToolError("The retention report needs video_id.");
+      const q = await analyticsQuery(token, {
+        ...base, filters: `video==${String(a.video_id)}`, dimensions: "elapsedVideoTimeRatio",
+        metrics: "audienceWatchRatio,relativeRetentionPerformance",
+      });
+      return { report, start_date: start, end_date: end, video_id: a.video_id, rows: asObjects(q) };
+    }
+    default:
+      throw new ToolError("report must be one of: videos, daily, traffic_sources, retention.");
+  }
+}
+
 export async function callTool(userId: string, name: string, a: Args, req: Request): Promise<unknown> {
   const sql = await db();
   if (name.startsWith("instagram_") && !instagramEnabled()) throw new ToolError("Instagram is not set up on this server (META_ACCESS_TOKEN is missing).");
@@ -800,6 +957,17 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
       });
       return { playlist_id: r.id, title: r.snippet.title };
     }
+    case "get_video_stats": {
+      const token = await accessToken(userId);
+      let ids: string[] = Array.isArray(a.video_ids) ? a.video_ids.map(String).filter(Boolean) : [];
+      if (ids.length > 50) throw new ToolError("Pass at most 50 video_ids.");
+      if (!ids.length) ids = await recentUploadIds(token, Math.min(50, Math.max(1, Number(a.max ?? 25))));
+      if (!ids.length) return [];
+      const details = await videoDetails(token, ids);
+      return ids.map((id) => details.get(id)).filter(Boolean).map((v) => statsRow(v as Args));
+    }
+    case "get_analytics":
+      return getAnalytics(await accessToken(userId), a);
     default:
       throw new ToolError(`Unknown tool ${name}`);
   }

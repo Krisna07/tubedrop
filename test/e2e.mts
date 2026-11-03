@@ -46,6 +46,8 @@ const captions: { videoId: string; data: Buffer; snippet: any }[] = [];
 const sessions = new Map<string, Session>();
 const log: string[] = [];
 let failNextSessionPut = 0;
+let analyticsMode: "ok" | "no-scope" | "disabled" = "ok";
+const analyticsQueries: Record<string, string>[] = [];
 let PORT = 0;
 const id = (p: string) => p + randomBytes(6).toString("hex");
 const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex").slice(0, 16);
@@ -153,8 +155,21 @@ const server = http.createServer(async (req, res) => {
   }
   // ---- YouTube data API
   if (p === "/youtube/v3/videos" && req.method === "GET") {
-    const v = videos.get(u.searchParams.get("id") ?? "");
-    return send(res, 200, { items: v ? [{ id: v.id, snippet: v.snippet, status: v.status }] : [] });
+    const found = (u.searchParams.get("id") ?? "").split(",").map((x) => videos.get(x)).filter(Boolean) as { id: string; snippet: any; status: any; data: Buffer }[];
+    return send(res, 200, { items: found.map((v) => ({ id: v.id, snippet: { ...v.snippet, publishedAt: "2026-11-01T09:00:00Z" }, status: v.status,
+      statistics: { viewCount: "1234", likeCount: "56", commentCount: "7" }, contentDetails: { duration: "PT58S" } })) });
+  }
+  // ---- YouTube Analytics API (host rewritten to /yta)
+  if (p === "/yta/v2/reports") {
+    analyticsQueries.push(Object.fromEntries(u.searchParams));
+    if (analyticsMode === "no-scope") return send(res, 403, { error: { code: 403, message: "Request had insufficient authentication scopes.", status: "PERMISSION_DENIED", details: [{ reason: "ACCESS_TOKEN_SCOPE_INSUFFICIENT" }] } });
+    if (analyticsMode === "disabled") return send(res, 403, { error: { code: 403, message: "YouTube Analytics API has not been used in project 123 before or it is disabled.", status: "PERMISSION_DENIED", details: [{ reason: "SERVICE_DISABLED" }] } });
+    const dim = u.searchParams.get("dimensions");
+    const metrics = (u.searchParams.get("metrics") ?? "").split(",");
+    const vid = [...videos.keys()][0];
+    const rows = dim === "video" ? [[vid, ...metrics.map((_, i) => 100 - i)]] : dim === "day" ? [["2026-11-01", ...metrics.map(() => 5)], ["2026-11-02", ...metrics.map(() => 9)]]
+      : dim === "insightTrafficSourceType" ? [["SHORTS", 80, 12], ["YT_SEARCH", 20, 3]] : [[0.01, 1.0, 0.6], [0.5, 0.42, 0.55]];
+    return send(res, 200, { kind: "youtubeAnalytics#resultTable", columnHeaders: [{ name: dim }, ...metrics.map((name) => ({ name }))], rows });
   }
   if (p === "/youtube/v3/videos" && req.method === "PUT") {
     const upd = JSON.parse(b.toString());
@@ -216,6 +231,7 @@ globalThis.fetch = (input: any, init?: any) => {
   let url = typeof input === "string" ? input : input.url;
   if (url.startsWith("https://graph.facebook.com/")) return fakeMeta(url, init);
   url = url.replace("https://www.googleapis.com", `http://127.0.0.1:${PORT}`);
+  url = url.replace("https://youtubeanalytics.googleapis.com", `http://127.0.0.1:${PORT}/yta`);
   if (url.startsWith("https://oauth2.googleapis.com")) return Promise.resolve(new Response(JSON.stringify({ access_token: "fresh", expires_in: 3600 }), { status: 200 }));
   return realFetch(url, init);
 };
@@ -379,6 +395,32 @@ const listed = await call("instagram_list_media");
 check("list_media returns the Reel and the publishing limit", listed.items.length === 1 && listed.items[0].type === "REELS" && listed.publishing_limit?.limit === 50, JSON.stringify(listed.publishing_limit));
 process.env.META_ACCESS_TOKEN = "revoked-token";
 check("a revoked token gives a clear fix", (await refusedCall("instagram_list_media", {})).includes("update META_ACCESS_TOKEN"));
+
+// ------------------------------------------------------------------ 11. Video stats and YouTube Analytics
+const someVid = [...videos.keys()][0];
+const stats = await call("get_video_stats", { video_ids: [someVid, "missing"] });
+check("get_video_stats returns views, likes, comments and Short detection", stats.length === 1 && stats[0].views === 1234 && stats[0].likes === 56 &&
+  stats[0].comments === 7 && stats[0].duration_seconds === 58 && stats[0].is_short === true, JSON.stringify(stats));
+check("get_video_stats refuses more than 50 ids", (await refusedCall("get_video_stats", { video_ids: Array.from({ length: 51 }, (_, i) => "v" + i) })).includes("50"));
+const top = await call("get_analytics", { report: "videos", start_date: "2026-10-01", end_date: "2026-11-02" });
+const q1 = analyticsQueries.at(-1)!;
+check("videos report asks for the channel's own data in the right range", q1.ids === "channel==MINE" && q1.startDate === "2026-10-01" && q1.endDate === "2026-11-02" && q1.dimensions === "video");
+check("videos report rows carry title, Short flag and metrics", top.rows.length === 1 && top.rows[0].video_id === someVid && top.rows[0].is_short === true &&
+  top.rows[0].views === 100 && "average_view_percentage" in top.rows[0] && "subscribers_gained" in top.rows[0], JSON.stringify(top.rows[0]));
+const daily = await call("get_analytics", { report: "daily", video_id: someVid });
+check("daily report defaults to the last 28 days and filters by video", daily.rows.length === 2 && analyticsQueries.at(-1)!.filters === `video==${someVid}` &&
+  (new Date(daily.end_date).getTime() - new Date(daily.start_date).getTime()) === 28 * 86400e3);
+const traffic = await call("get_analytics", { report: "traffic_sources" });
+check("traffic_sources report lists sources", traffic.rows[0].insight_traffic_source_type === "SHORTS" && traffic.rows[0].views === 80);
+check("retention needs a video_id", (await refusedCall("get_analytics", { report: "retention" })).includes("video_id"));
+const ret = await call("get_analytics", { report: "retention", video_id: someVid });
+check("retention report returns the curve", ret.rows.length === 2 && ret.rows[1].audience_watch_ratio === 0.42);
+check("bad dates are refused", (await refusedCall("get_analytics", { start_date: "last week" })).includes("2026-10-01"));
+analyticsMode = "no-scope";
+check("missing analytics permission says to reconnect", (await refusedCall("get_analytics", {})).includes("reconnect TubeDrop"));
+analyticsMode = "disabled";
+check("disabled Analytics API says to enable it", (await refusedCall("get_analytics", {})).includes("Enable \"YouTube Analytics API\""));
+analyticsMode = "ok";
 
 const failed = results.filter((r) => !r[1]);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);

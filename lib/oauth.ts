@@ -5,6 +5,7 @@ import { b64urlSha256, baseUrl, db, encrypt, env, escapeHtml, formOrJson, html, 
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly";
 const YT_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl";
 const DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"; // write into the app's own upload folder
+const ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.readonly"; // optional: get_analytics explains how to grant it if missing
 
 const ACCESS_TTL = 60 * 60;
 const REFRESH_TTL = 60 * 60 * 24 * 60;
@@ -184,7 +185,7 @@ export async function googleCallback(req: Request) {
   const state = randomId(24);
   await sql`INSERT INTO pending (state, client_id, redirect_uri, code_challenge, client_state, stage, user_id)
             VALUES (${state}, ${p.client_id}, ${p.redirect_uri}, ${p.code_challenge}, ${p.client_state}, 'yt', ${claims.sub})`;
-  return redirect(googleUrl(req, [YT_SCOPE], state, claims.email));
+  return redirect(googleUrl(req, [YT_SCOPE, ANALYTICS_SCOPE], state, claims.email));
 }
 
 async function issue(userId: string, clientId: string) {
