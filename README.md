@@ -128,6 +128,13 @@ Reel specs: MP4 or MOV, H.264 or HEVC, AAC audio, 3 seconds to 15 minutes, 9:16 
   "View YouTube Analytics reports" permission, which the YouTube sign-in now asks for. If you connected before this
   was added, disconnect and reconnect once. Analytics data lags about two days.
 
+## Comments
+
+- `list_comments`: the latest top-level comments across the channel (or one video), with whether the channel already replied.
+- `reply_to_comment`: posts a public reply as the channel; it requires `user_confirmed: true`.
+
+Both use the existing YouTube permission (`youtube.force-ssl`); no reconnect is needed.
+
 ## Limits worth knowing
 
 - **Quota.** Your Google Cloud project has a daily YouTube Data API quota (10,000 units by default); a video

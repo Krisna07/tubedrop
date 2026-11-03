@@ -48,6 +48,8 @@ const log: string[] = [];
 let failNextSessionPut = 0;
 let analyticsMode: "ok" | "no-scope" | "disabled" = "ok";
 const analyticsQueries: Record<string, string>[] = [];
+const commentQueries: Record<string, string>[] = [];
+const postedReplies: any[] = [];
 let PORT = 0;
 const id = (p: string) => p + randomBytes(6).toString("hex");
 const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex").slice(0, 16);
@@ -178,6 +180,20 @@ const server = http.createServer(async (req, res) => {
       return send(res, 400, { error: { message: "A video can only be scheduled while private", errors: [{ reason: "invalidPublishAt" }] } });
     v.snippet = upd.snippet; v.status = upd.status;
     return send(res, 200, { id: v.id, snippet: v.snippet, status: v.status });
+  }
+  // ---- YouTube comments
+  if (p === "/youtube/v3/commentThreads" && req.method === "GET") {
+    commentQueries.push(Object.fromEntries(u.searchParams));
+    return send(res, 200, { items: [
+      { id: "t1", snippet: { videoId: "vA", totalReplyCount: 0, topLevelComment: { id: "c1", snippet: { authorDisplayName: "@fan", textDisplay: "Love this!", likeCount: 2, publishedAt: "2026-11-02T00:00:00Z", authorChannelId: { value: "UCfan" } } } } },
+      { id: "t2", snippet: { videoId: "vB", totalReplyCount: 1, topLevelComment: { id: "c2", snippet: { authorDisplayName: "@q", textDisplay: "Is this real?", likeCount: 0, authorChannelId: { value: "UCq" } } } },
+        replies: { comments: [{ snippet: { authorChannelId: { value: "UC1" }, textDisplay: "Yes!" } }] } },
+    ] });
+  }
+  if (p === "/youtube/v3/comments" && req.method === "POST") {
+    const bodyJ = JSON.parse(b.toString());
+    postedReplies.push(bodyJ);
+    return send(res, 200, { id: "r_" + postedReplies.length, snippet: bodyJ.snippet });
   }
   return send(res, 404, { error: { message: `fake google: no route ${req.method} ${p}` } });
 });
@@ -421,6 +437,16 @@ check("missing analytics permission says to reconnect", (await refusedCall("get_
 analyticsMode = "disabled";
 check("disabled Analytics API says to enable it", (await refusedCall("get_analytics", {})).includes("Enable \"YouTube Analytics API\""));
 analyticsMode = "ok";
+
+// ------------------------------------------------------------------ 12. Comments
+const allC = await call("list_comments", {});
+check("list_comments reads the channel's threads", commentQueries.at(-1)!.allThreadsRelatedToChannelId === "UC1" && allC.length === 2 && allC[0].text === "Love this!");
+check("list_comments marks threads the channel already answered", allC[1].channel_replied === true && allC[0].channel_replied === false);
+const openC = await call("list_comments", { unanswered_only: true, video_id: "vA" });
+check("unanswered_only filters and video_id narrows", openC.length === 1 && commentQueries.at(-1)!.videoId === "vA");
+check("reply needs user_confirmed", (await refusedCall("reply_to_comment", { comment_id: "c1", text: "Thanks!" })).includes("user_confirmed"));
+const rep = await call("reply_to_comment", { comment_id: "c1", text: "Thanks for watching!", user_confirmed: true });
+check("reply posts under the parent comment", rep.reply_id === "r_1" && postedReplies[0].snippet.parentId === "c1" && postedReplies[0].snippet.textOriginal === "Thanks for watching!");
 
 const failed = results.filter((r) => !r[1]);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
