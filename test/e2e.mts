@@ -47,6 +47,21 @@ const sessions = new Map<string, Session>();
 const log: string[] = [];
 let failNextSessionPut = 0;
 let analyticsMode: "ok" | "no-scope" | "disabled" = "ok";
+let searchQuota: "ok" | "exceeded" = "ok";
+const searchQueries: Record<string, string>[] = [];
+const chartQueries: Record<string, string>[] = [];
+const hoursAgo = (h: number) => new Date(Date.now() - h * 3600e3).toISOString();
+// Other creators' videos that the platform-wide search and chart return.
+const trendingVideos = [
+  { id: "tr_new", title: "Small but brand new #shorts", channel: "Chan A", published: hoursAgo(2), views: 4000, dur: "PT30S" },     // 2000 views/hour
+  { id: "tr_big", title: "Huge but older #shorts", channel: "Chan B", published: hoursAgo(100), views: 50000, dur: "PT45S" },      // 500 views/hour
+  { id: "tr_long", title: "Ten minute documentary", channel: "Chan C", published: hoursAgo(5), views: 90000, dur: "PT10M" },       // not a Short
+  { id: "tr_stale", title: "Viral last month #shorts", channel: "Chan D", published: hoursAgo(24 * 12), views: 900000, dur: "PT20S" }, // outside 7 days
+];
+const trendingItem = (t: (typeof trendingVideos)[number]) => ({
+  id: t.id, snippet: { title: t.title, channelTitle: t.channel, channelId: "UC_" + t.channel, publishedAt: t.published },
+  status: { privacyStatus: "public" }, statistics: { viewCount: String(t.views), likeCount: "10", commentCount: "2" }, contentDetails: { duration: t.dur },
+});
 const analyticsQueries: Record<string, string>[] = [];
 const commentQueries: Record<string, string>[] = [];
 const postedReplies: any[] = [];
@@ -156,6 +171,18 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, { id: f.id, name: f.name, mimeType: f.mimeType, size: String(f.data.length), parents: f.parents });
   }
   // ---- YouTube data API
+  if (p === "/youtube/v3/search" && req.method === "GET") {
+    searchQueries.push(Object.fromEntries(u.searchParams));
+    if (searchQuota === "exceeded") return send(res, 403, { error: { code: 403, message: "The request cannot be completed because you have exceeded your quota.", errors: [{ reason: "quotaExceeded" }] } });
+    return send(res, 200, { items: trendingVideos.map((t) => ({ id: { kind: "youtube#video", videoId: t.id }, snippet: { title: t.title } })) });
+  }
+  if (p === "/youtube/v3/videos" && req.method === "GET" && u.searchParams.get("chart") === "mostPopular") {
+    chartQueries.push(Object.fromEntries(u.searchParams));
+    return send(res, 200, { items: trendingVideos.map(trendingItem) });
+  }
+  if (p === "/youtube/v3/videos" && req.method === "GET" && (u.searchParams.get("id") ?? "").split(",").some((x) => x.startsWith("tr_"))) {
+    return send(res, 200, { items: (u.searchParams.get("id") ?? "").split(",").map((x) => trendingVideos.find((t) => t.id === x)).filter(Boolean).map((t) => trendingItem(t!)) });
+  }
   if (p === "/youtube/v3/videos" && req.method === "GET") {
     const found = (u.searchParams.get("id") ?? "").split(",").map((x) => videos.get(x)).filter(Boolean) as { id: string; snippet: any; status: any; data: Buffer }[];
     return send(res, 200, { items: found.map((v) => ({ id: v.id, snippet: { ...v.snippet, publishedAt: "2026-11-01T09:00:00Z" }, status: v.status,
@@ -447,6 +474,30 @@ check("unanswered_only filters and video_id narrows", openC.length === 1 && comm
 check("reply needs user_confirmed", (await refusedCall("reply_to_comment", { comment_id: "c1", text: "Thanks!" })).includes("user_confirmed"));
 const rep = await call("reply_to_comment", { comment_id: "c1", text: "Thanks for watching!", user_confirmed: true });
 check("reply posts under the parent comment", rep.reply_id === "r_1" && postedReplies[0].snippet.parentId === "c1" && postedReplies[0].snippet.textOriginal === "Thanks for watching!");
+
+// ------------------------------------------------------------------ 13. Platform-wide trending
+const trend = await call("find_trending", { query: "couple argument", category_id: "23", region_code: "au" });
+const sq = searchQueries.at(-1)!;
+check("find_trending searches recent videos by view count, Shorts only", sq.type === "video" && sq.order === "viewCount" && sq.videoDuration === "short" &&
+  sq.q === "couple argument" && sq.videoCategoryId === "23" && sq.regionCode === "AU", JSON.stringify(sq));
+check("find_trending looks back 7 days by default", Math.abs(Date.now() - new Date(sq.publishedAfter).getTime() - 7 * 86400e3) < 60e3);
+check("find_trending ranks by views per hour, not total views", trend.items[0]?.video_id === "tr_new" && trend.items[1]?.video_id === "tr_big" &&
+  trend.items[0].views_per_hour > trend.items[1].views_per_hour, trend.items.map((i: any) => `${i.video_id}:${i.views_per_hour}`).join(" "));
+check("find_trending drops non-Shorts and videos outside the window", trend.items.length === 2, trend.items.map((i: any) => i.video_id).join(","));
+check("find_trending items carry channel, link and Short flag", trend.items[0].channel === "Chan A" && trend.items[0].url === "https://youtu.be/tr_new" && trend.items[0].is_short === true);
+check("find_trending reports the quota it used", trend.quota_cost === 101);
+const longToo = await call("find_trending", { shorts_only: false, published_within_days: 30 });
+check("shorts_only:false keeps long videos; a 30-day window keeps older ones", longToo.items.length === 4 && "videoDuration" in searchQueries.at(-1)! === false, longToo.items.map((i: any) => i.video_id).join(","));
+const capped = await call("find_trending", { max: 1 });
+check("max limits the number returned", capped.items.length === 1);
+const pop = await call("find_trending", { mode: "popular" });
+check("popular mode reads the most-popular chart for the US by default for 1 unit", chartQueries.at(-1)!.chart === "mostPopular" && chartQueries.at(-1)!.regionCode === "US" &&
+  pop.quota_cost === 1 && pop.items[0].video_id === "tr_new" && pop.items.length === 2, JSON.stringify(chartQueries.at(-1)));
+check("find_trending refuses a bad region code", (await refusedCall("find_trending", { region_code: "Australia" })).includes("two-letter"));
+check("find_trending refuses an unknown mode", (await refusedCall("find_trending", { mode: "hot" })).includes("mode"));
+searchQuota = "exceeded";
+check("exhausted quota gives a clear message and points to popular mode", (await refusedCall("find_trending", {})).includes("popular"));
+searchQuota = "ok";
 
 const failed = results.filter((r) => !r[1]);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
