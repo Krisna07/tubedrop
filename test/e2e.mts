@@ -122,6 +122,7 @@ const server = http.createServer(async (req, res) => {
     return send(res, 308, undefined, rangeHdr());
   }
   if (!auth.startsWith("Bearer ")) return send(res, 401, { error: { message: "no auth" } });
+  if (p === "/youtube/v3/channels" && u.searchParams.get("mine") === "true") return send(res, 200, { items: [{ id: "UC2", snippet: { title: "Second Channel" } }] });
   // ---- uploads
   if (p === "/upload/drive/v3/files" && u.searchParams.get("uploadType") === "resumable") {
     const meta = JSON.parse(b.toString());
@@ -275,13 +276,15 @@ globalThis.fetch = (input: any, init?: any) => {
   if (url.startsWith("https://graph.facebook.com/")) return fakeMeta(url, init);
   url = url.replace("https://www.googleapis.com", `http://127.0.0.1:${PORT}`);
   url = url.replace("https://youtubeanalytics.googleapis.com", `http://127.0.0.1:${PORT}/yta`);
+  if (url.startsWith("https://oauth2.googleapis.com") && String(init?.body).includes("authorization_code"))
+    return Promise.resolve(new Response(JSON.stringify({ access_token: "new-yt-access", refresh_token: "new-yt-refresh", expires_in: 3600, scope: "https://www.googleapis.com/auth/youtube.force-ssl" }), { status: 200 }));
   if (url.startsWith("https://oauth2.googleapis.com")) return Promise.resolve(new Response(JSON.stringify({ access_token: "fresh", expires_in: 3600 }), { status: 200 }));
   return realFetch(url, init);
 };
 
 // ------------------------------------------------------------------ the server under test
 const { POST, GET } = await import(pathToFileURL(`${ROOT}/api/index.ts`).href);
-const { db, encrypt, sha256 } = await import(pathToFileURL(`${ROOT}/lib/util.ts`).href);
+const { db, decrypt, encrypt, sha256 } = await import(pathToFileURL(`${ROOT}/lib/util.ts`).href);
 serverGET = GET;
 const sql = await db();
 const exp = new Date(Date.now() + 3600e3).toISOString();
@@ -498,6 +501,30 @@ check("find_trending refuses an unknown mode", (await refusedCall("find_trending
 searchQuota = "exceeded";
 check("exhausted quota gives a clear message and points to popular mode", (await refusedCall("find_trending", {})).includes("popular"));
 searchQuota = "ok";
+
+// ------------------------------------------------------------------ 14. Multiple channels
+const ch0 = await call("list_channels");
+check("existing single-channel users are migrated into the channels table", ch0.channels.length === 1 && ch0.channels[0].channel_id === "UC1" && ch0.channels[0].active === true, JSON.stringify(ch0));
+const added = await call("add_channel");
+const addUrl = new URL(added.sign_in_url);
+check("add_channel returns a Google sign-in URL asking for YouTube access", addUrl.hostname === "accounts.google.com" && addUrl.searchParams.get("scope")!.includes("youtube.force-ssl"), added.sign_in_url);
+const cb = await GET(new Request(`https://uploader.test/google/callback?code=abc&state=${addUrl.searchParams.get("state")}`));
+check("the add-channel callback links the channel without touching the OAuth flow", cb.status === 200 && (await cb.text()).includes("Channel added"), String(cb.status));
+const ch1 = await call("list_channels");
+check("the new channel is listed and the active one is unchanged", ch1.channels.length === 2 && ch1.active_channel_id === "UC1" && ch1.channels.find((c: any) => c.channel_id === "UC2")?.title === "Second Channel", JSON.stringify(ch1));
+const sw = await call("switch_channel", { channel: "second channel" });
+check("switch_channel finds a channel by title", sw.active_channel_id === "UC2", JSON.stringify(sw));
+const who2 = await call("whoami");
+check("whoami reports the newly active channel", who2.channel_id === "UC2" && who2.channel === "Second Channel", JSON.stringify(who2));
+await call("list_my_videos", {});
+const act = (await sql`SELECT yt_refresh_enc, yt_access_enc FROM users WHERE id = 'u1'`)[0];
+check("after a switch YouTube tools use the new channel's own credentials", decrypt(act.yt_refresh_enc) === "new-yt-refresh" && decrypt(act.yt_access_enc) === "fresh");
+const back = await call("switch_channel", { channel: "UC1" });
+check("switch_channel accepts a channel id and switches back", back.active_channel_id === "UC1");
+const bad = await call("switch_channel", { channel: "nope" }).then(() => "", (e: Error) => e.message);
+check("an unknown channel gives a helpful error", /No linked channel/.test(bad), bad);
+const stale = await GET(new Request(`https://uploader.test/google/callback?code=abc&state=${addUrl.searchParams.get("state")}`));
+check("an add-channel link cannot be reused", stale.status === 400);
 
 const failed = results.filter((r) => !r[1]);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);

@@ -1,6 +1,7 @@
 import { accessToken, driveBytes, driveId, driveMeta, driveSearch, gfetch, gjson, ToolError } from "./google.js";
 import { continuePublish, instagramEnabled, listMedia, publishingLimit, publishReel, whoamiInstagram } from "./instagram.js";
 import { baseUrl, db, decrypt, encrypt, env, randomId } from "./util.js";
+import { ANALYTICS_SCOPE, googleUrl, YT_SCOPE } from "./oauth.js";
 
 const YT = "https://www.googleapis.com/youtube/v3";
 const UPLOADS_FOLDER_NAME = "TubeDrop Uploads";
@@ -34,6 +35,21 @@ export const TOOLS = [
   {
     name: "whoami",
     description: "Show which Google account and YouTube channel this connector is signed in to.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "list_channels",
+    description: "List every YouTube channel linked to this connector and which one is active. All YouTube tools act on the active channel.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "switch_channel",
+    description: "Make another linked YouTube channel the active one (uploads, analytics, comments and so on then use it). Call it before working on a channel; the choice persists until changed. Accepts a channel id or its title.",
+    inputSchema: { type: "object", properties: { channel: { type: "string", description: "Channel id (UC...) or title, case-insensitive." } }, required: ["channel"] },
+  },
+  {
+    name: "add_channel",
+    description: "Link another YouTube channel (one per niche). Returns a Google sign-in URL for the user to open; on the Google screen they pick the channel/brand account to add. Afterwards use switch_channel.",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -949,10 +965,42 @@ async function getAnalytics(token: string, a: Args) {
   }
 }
 
+/** Make sure the active channel (users.yt_*) also has a row in channels, e.g. for accounts linked before multi-channel support. */
+async function syncActiveChannel(sql: Awaited<ReturnType<typeof db>>, userId: string) {
+  await sql`INSERT INTO channels (user_id, channel_id, title, yt_refresh_enc) SELECT id, channel_id, channel_title, yt_refresh_enc FROM users
+            WHERE id = ${userId} AND channel_id IS NOT NULL AND yt_refresh_enc IS NOT NULL ON CONFLICT DO NOTHING`;
+}
+
 export async function callTool(userId: string, name: string, a: Args, req: Request): Promise<unknown> {
   const sql = await db();
   if (name.startsWith("instagram_") && !instagramEnabled()) throw new ToolError("Instagram is not set up on this server (META_ACCESS_TOKEN is missing).");
   switch (name) {
+    case "list_channels": {
+      await syncActiveChannel(sql, userId);
+      const rows = await sql`SELECT channel_id, title FROM channels WHERE user_id = ${userId} ORDER BY created_at`;
+      const active = (await sql`SELECT channel_id FROM users WHERE id = ${userId}`)[0]?.channel_id;
+      return { active_channel_id: active ?? null, channels: rows.map((r) => ({ channel_id: r.channel_id, title: r.title, active: r.channel_id === active, url: `https://www.youtube.com/channel/${r.channel_id}` })) };
+    }
+    case "switch_channel": {
+      await syncActiveChannel(sql, userId);
+      const want = String(a.channel ?? "").trim().toLowerCase();
+      if (!want) throw new ToolError("Give a channel id or title. Use list_channels to see them.");
+      const rows = await sql`SELECT channel_id, title, yt_refresh_enc FROM channels WHERE user_id = ${userId}`;
+      let hits = rows.filter((r) => r.channel_id.toLowerCase() === want);
+      if (!hits.length) hits = rows.filter((r) => (r.title ?? "").toLowerCase() === want);
+      if (!hits.length) hits = rows.filter((r) => (r.title ?? "").toLowerCase().includes(want));
+      if (hits.length !== 1) throw new ToolError(hits.length ? `More than one channel matches "${a.channel}". Use the channel id.` : `No linked channel matches "${a.channel}". Use list_channels, or add_channel to link a new one.`);
+      const c = hits[0];
+      await sql`UPDATE users SET yt_refresh_enc = ${c.yt_refresh_enc}, yt_access_enc = NULL, yt_expiry = NULL, channel_id = ${c.channel_id}, channel_title = ${c.title}, updated_at = now() WHERE id = ${userId}`;
+      return { active_channel_id: c.channel_id, title: c.title, note: "Channel switched. It stays active until you switch again." };
+    }
+    case "add_channel": {
+      const state = randomId(24);
+      await sql`DELETE FROM pending WHERE created_at < now() - interval '15 minutes'`;
+      await sql`INSERT INTO pending (state, client_id, redirect_uri, code_challenge, stage, user_id) VALUES (${state}, '', '', '', 'yt_add', ${userId})`;
+      const email = (await sql`SELECT email FROM users WHERE id = ${userId}`)[0]?.email;
+      return { sign_in_url: googleUrl(req, [YT_SCOPE, ANALYTICS_SCOPE], state, email), note: "Open this link within 15 minutes, choose the YouTube channel (or brand account) to add, then call switch_channel." };
+    }
     case "whoami": {
       const u = (await sql`SELECT email, channel_id, channel_title FROM users WHERE id = ${userId}`)[0];
       const out: Args = { google_account: u?.email, channel: u?.channel_title, channel_id: u?.channel_id, channel_url: u?.channel_id ? `https://www.youtube.com/channel/${u.channel_id}` : null };

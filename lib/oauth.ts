@@ -3,9 +3,9 @@ import { b64urlSha256, baseUrl, db, encrypt, env, escapeHtml, formOrJson, html, 
 // Two Google sign-ins: the personal account for Drive (brand accounts have no Drive), then the
 // account or brand channel that owns the YouTube channel.
 const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly";
-const YT_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl";
+export const YT_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl";
 const DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"; // write into the app's own upload folder
-const ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.readonly"; // optional: get_analytics explains how to grant it if missing
+export const ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.readonly"; // optional: get_analytics explains how to grant it if missing
 
 const ACCESS_TTL = 60 * 60;
 const REFRESH_TTL = 60 * 60 * 24 * 60;
@@ -21,7 +21,7 @@ function redirectAllowed(uri: string): boolean {
   }
 }
 
-function googleUrl(req: Request, scopes: string[], state: string, hint?: string): string {
+export function googleUrl(req: Request, scopes: string[], state: string, hint?: string): string {
   const g = new URL("https://accounts.google.com/o/oauth2/v2/auth");
   g.searchParams.set("client_id", env("GOOGLE_CLIENT_ID"));
   g.searchParams.set("redirect_uri", `${baseUrl(req)}/google/callback`);
@@ -146,16 +146,24 @@ export async function googleCallback(req: Request) {
   const granted = (t.scope ?? "").split(" ");
   const expiry = new Date(Date.now() + (t.expires_in ?? 3600) * 1000 - 60000).toISOString();
 
-  if (p.stage === "yt") {
+  if (p.stage === "yt" || p.stage === "yt_add") {
     // Step 2: the YouTube channel (personal or brand account).
     if (!granted.includes(YT_SCOPE)) return html("<h1>YouTube permission was not granted</h1><p>Press Connect again and tick the YouTube box.</p>", 400);
     const ch = await fetch("https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true", { headers: { authorization: `Bearer ${t.access_token}` } });
     const chJson = (await ch.json()) as { items?: { id: string; snippet: { title: string } }[] };
     const channel = chJson.items?.[0];
     if (!channel) return html("<h1>That account has no YouTube channel</h1><p>Go back to Claude, press Connect again, and on the second Google screen pick the YouTube channel you want to upload to.</p>", 400);
-    const existing = await sql`SELECT yt_refresh_enc FROM users WHERE id = ${p.user_id}`;
-    const ytRefresh = t.refresh_token ? encrypt(t.refresh_token) : existing[0]?.yt_refresh_enc ?? null;
+    const existing = await sql`SELECT yt_refresh_enc FROM channels WHERE user_id = ${p.user_id} AND channel_id = ${channel.id}`;
+    const legacy = await sql`SELECT yt_refresh_enc, channel_id FROM users WHERE id = ${p.user_id}`;
+    const ytRefresh = t.refresh_token
+      ? encrypt(t.refresh_token)
+      : existing[0]?.yt_refresh_enc ?? (legacy[0]?.channel_id === channel.id ? legacy[0]?.yt_refresh_enc : null) ?? null;
     if (!ytRefresh) return html("<h1>Google did not return offline access</h1><p>Remove the app at myaccount.google.com/permissions and connect again.</p>", 400);
+    await sql`INSERT INTO channels (user_id, channel_id, title, yt_refresh_enc) VALUES (${p.user_id}, ${channel.id}, ${channel.snippet.title}, ${ytRefresh})
+              ON CONFLICT (user_id, channel_id) DO UPDATE SET title = EXCLUDED.title, yt_refresh_enc = EXCLUDED.yt_refresh_enc`;
+    if (p.stage === "yt_add") {
+      return html(`<h1>Channel added</h1><p><b>${escapeHtml(channel.snippet.title)}</b> is linked. Go back to Claude and ask it to switch to that channel.</p>`);
+    }
     await sql`UPDATE users SET yt_refresh_enc = ${ytRefresh}, yt_access_enc = ${encrypt(t.access_token)}, yt_expiry = ${expiry},
               channel_id = ${channel.id}, channel_title = ${channel.snippet.title}, updated_at = now() WHERE id = ${p.user_id}`;
     const code = randomId(32);
