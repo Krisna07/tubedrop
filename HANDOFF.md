@@ -17,7 +17,7 @@ One hosted TubeDrop for many people: a small dashboard where a user signs in (wi
 ## How it works
 
 - `api/index.ts`: one Vercel function (`vercel.json` rewrites everything to it). Routes: OAuth metadata (`/.well-known/...`), `/register` (dynamic client registration), `/authorize`, `/google/callback`, `/token`, `/mcp` (stateless Streamable HTTP, JSON-RPC), `/` (home page).
-- `lib/oauth.ts`: TubeDrop is its own OAuth 2.1 server (PKCE S256) for Claude, delegating sign-in to Google in two steps: (1) the personal Google account: identity + Drive (`drive.readonly`, `drive.file`); (2) the YouTube channel account, which may be a brand account (`youtube.force-ssl`). `ALLOWED_EMAILS` gates step 1. Only Claude redirect hosts (claude.ai, claude.com, localhost) are accepted.
+- `lib/oauth.ts`: TubeDrop is its own OAuth 2.1 server (PKCE S256), delegating sign-in to Google in two steps: (1) the personal Google account: identity + Drive (`drive.readonly`, `drive.file`); (2) the YouTube channel account, which may be a brand account (`youtube.force-ssl`). `ALLOWED_EMAILS` gates step 1. Claude and localhost callbacks are allowed by default; add exact additional callback URLs with `OAUTH_REDIRECT_URIS` and CIMD hostnames with `OAUTH_CLIENT_METADATA_HOSTS`.
 - `lib/util.ts`: env, AES-256-GCM encryption of stored Google tokens (`ENC_KEY`), Neon client, schema creation and migration on first use. `globalThis.__uploaderSql` is a test seam (in-process Postgres).
 - `lib/google.ts`: Google access-token refresh, fetch helpers, Drive helpers.
 - `lib/tools.ts`: the MCP tools and the upload "pump".

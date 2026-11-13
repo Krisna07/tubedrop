@@ -1,10 +1,11 @@
-# TubeDrop: YouTube uploads for Claude (self-hosted MCP connector)
+# TubeDrop: YouTube uploads via MCP (self-hosted connector)
 
-A remote MCP server that lets Claude upload videos to **your own** YouTube channel, with **your own** Google
+A remote MCP server that lets compatible MCP clients upload videos to **your own** YouTube channel, with **your own** Google
 credentials. It runs on Vercel with a Neon Postgres database. Nothing is shared with anyone else: your Google
 Cloud project, your API quota, your channel.
 
-What Claude can do with it: upload a video (with title, description, tags, category, privacy or a scheduled
+The connector works with Claude and can be configured for other MCP clients, including ChatGPT and Grok clients
+that support remote Streamable HTTP MCP and OAuth. What it can do: upload a video (with title, description, tags, category, privacy or a scheduled
 `publish_at`, AI-content disclosure), set a thumbnail, add captions, edit a video's metadata or schedule, list
 recent uploads, and manage playlists. Optionally it can also publish Reels to your Instagram professional
 account (see [Instagram Reels](#instagram-reels-optional)).
@@ -44,6 +45,8 @@ Fork this repository (or use it as a template) into your own GitHub account.
 | `ENC_KEY` | yes | A random 32-byte key: `openssl rand -base64 32`. Keep it secret; it encrypts the stored Google tokens. |
 | `DATABASE_URL` | yes | Set by the Neon integration |
 | `ALLOWED_EMAILS` | strongly recommended | Your Google account email(s), comma-separated. Anyone else is refused. |
+| `OAUTH_REDIRECT_URIS` | optional | Exact additional OAuth callback URLs, comma-separated. Required for clients whose callback is not on Claude's or localhost's default domains. |
+| `OAUTH_CLIENT_METADATA_HOSTS` | optional | Additional trusted hostnames for OAuth Client ID Metadata Documents, comma-separated. Only set this if the client uses CIMD instead of dynamic client registration. |
 | `PUBLIC_URL` | optional | e.g. `https://my-uploader.vercel.app` if you use a custom domain |
 | `GITHUB_TOKEN`, `MEDIA_REPO` (owner/repo), `SKETCHFAB_TOKEN` | optional | Only for the GitHub-relay and Sketchfab tools |
 | `META_ACCESS_TOKEN` | optional | Only for Instagram Reels. The Instagram tools appear only when this is set. |
@@ -52,11 +55,33 @@ Fork this repository (or use it as a template) into your own GitHub account.
 
 Check it: opening `https://tubedrop.vercel.app/` shows a short "TubeDrop" page.
 
-### 4. Connect Claude
+### 4. Connect an MCP client
 
-1. In Claude: **Settings → Connectors → Add custom connector**, URL `https://tubedrop.vercel.app/mcp`.
-2. Press **Connect**. Google asks twice: first Drive access, then YouTube (pick your channel). Tick the boxes.
-3. Ask Claude "which channel is TubeDrop connected to?" It should answer with your channel.
+For Claude, open **Settings → Connectors → Add custom connector** and use
+`https://tubedrop.vercel.app/mcp`.
+Press **Connect**. Google asks twice: first Drive access, then YouTube (pick your channel). Tick the boxes.
+Ask which channel TubeDrop is connected to. It should answer with your channel.
+
+#### ChatGPT
+
+On ChatGPT web, add a custom MCP server/plugin and enter `https://tubedrop.vercel.app/mcp` with OAuth authentication.
+If ChatGPT uses a callback URL not already accepted by TubeDrop, add that exact URI to Vercel's
+`OAUTH_REDIRECT_URIS` environment variable. If you select Client ID Metadata Documents rather than dynamic client
+registration, also add the hostname of ChatGPT's client metadata URL to `OAUTH_CLIENT_METADATA_HOSTS`.
+Use the callback and metadata URL shown by ChatGPT; do not guess or allow broad domains. Redeploy after changing
+environment variables, then complete the Google sign-in and install the app in ChatGPT.
+
+#### Grok CLI
+
+Grok CLI's local OAuth callback is supported by default. Add the remote connector:
+
+```bash
+grok mcp add --transport http tubedrop https://tubedrop.vercel.app/mcp
+grok mcp doctor tubedrop
+```
+
+Complete the browser sign-in when prompted. This documents the Grok CLI flow; other Grok products may have different
+MCP and OAuth configuration options.
 
 ## How uploads work
 

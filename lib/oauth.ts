@@ -11,14 +11,24 @@ const ACCESS_TTL = 60 * 60;
 const REFRESH_TTL = 60 * 60 * 24 * 60;
 const ALLOWED_REDIRECT_HOSTS = ["claude.ai", "claude.com", "localhost", "127.0.0.1"];
 
+function configuredList(name: string): string[] {
+  return (process.env[name] ?? "").split(",").map((value) => value.trim()).filter(Boolean);
+}
+
 function redirectAllowed(uri: string): boolean {
   try {
     const u = new URL(uri);
     if (u.protocol !== "https:" && !(u.hostname === "localhost" || u.hostname === "127.0.0.1")) return false;
-    return ALLOWED_REDIRECT_HOSTS.some((h) => u.hostname === h || u.hostname.endsWith("." + h));
+    const trustedHost = ALLOWED_REDIRECT_HOSTS.some((h) => u.hostname === h || u.hostname.endsWith("." + h));
+    return trustedHost || configuredList("OAUTH_REDIRECT_URIS").includes(uri);
   } catch {
     return false;
   }
+}
+
+function metadataHostAllowed(host: string): boolean {
+  const trustedDefaultHost = ALLOWED_REDIRECT_HOSTS.some((h) => host === h || host.endsWith("." + h));
+  return trustedDefaultHost || configuredList("OAUTH_CLIENT_METADATA_HOSTS").includes(host);
 }
 
 export function googleUrl(req: Request, scopes: string[], state: string, hint?: string): string {
@@ -65,7 +75,7 @@ export async function register(req: Request) {
   const body = (await req.json().catch(() => ({}))) as { redirect_uris?: string[]; client_name?: string };
   const uris = (body.redirect_uris ?? []).filter((u) => typeof u === "string");
   if (!uris.length || !uris.every(redirectAllowed)) {
-    return json({ error: "invalid_redirect_uri", error_description: "Only Claude redirect URIs are accepted." }, 400);
+    return json({ error: "invalid_redirect_uri", error_description: "The OAuth redirect URI is not allowed by this server." }, 400);
   }
   const sql = await db();
   const id = "c_" + randomId(16);
@@ -88,7 +98,7 @@ async function clientRedirects(clientId: string): Promise<string[] | null> {
   if (clientId.startsWith("https://")) {
     try {
       const host = new URL(clientId).hostname;
-      if (!ALLOWED_REDIRECT_HOSTS.some((h) => host === h || host.endsWith("." + h))) return null;
+      if (!metadataHostAllowed(host)) return null;
       const r = await fetch(clientId, { headers: { accept: "application/json" } });
       if (!r.ok) return null;
       const doc = (await r.json()) as { client_id?: string; redirect_uris?: string[] };

@@ -24,6 +24,7 @@ process.env.ENC_KEY = randomBytes(32).toString("base64");
 process.env.GOOGLE_CLIENT_ID = "test-client";
 process.env.GOOGLE_CLIENT_SECRET = "test-secret";
 process.env.PUBLIC_URL = "https://uploader.test";
+process.env.OAUTH_REDIRECT_URIS = "https://chatgpt.example/oauth/callback";
 process.env.IG_POLL_SECONDS = "0";                  // one Instagram status check per call
 delete process.env.META_ACCESS_TOKEN;                // Instagram is switched on later in the test
 
@@ -329,6 +330,28 @@ async function uploadSh(url: string, file: string, type: string) {
 
 const results: [string, boolean, string?][] = [];
 const check = (name: string, ok: boolean, info = "") => { results.push([name, ok, info]); console.log(`${ok ? "PASS" : "FAIL"}  ${name}${info ? "  — " + info : ""}`); };
+
+// ------------------------------------------------------------------ OAuth client redirect allowlist
+{
+  const allowed = await POST(new Request("https://uploader.test/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_name: "ChatGPT test", redirect_uris: ["https://chatgpt.example/oauth/callback"] }),
+  }));
+  const denied = await POST(new Request("https://uploader.test/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_name: "Unconfigured test", redirect_uris: ["https://chatgpt.example/other"] }),
+  }));
+  const local = await POST(new Request("https://uploader.test/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_name: "Grok CLI test", redirect_uris: ["http://localhost:4321/callback"] }),
+  }));
+  check("configured OAuth callback is accepted", allowed.status === 201);
+  check("unconfigured callback on same host is rejected", denied.status === 400);
+  check("localhost OAuth callback remains available", local.status === 201);
+}
 
 // ------------------------------------------------------------------ 0. auth and tool list
 {

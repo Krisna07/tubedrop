@@ -91,8 +91,8 @@ async function mcp(req: Request): Promise<Response> {
 function home(req: Request): Response {
   const base = baseUrl(req);
   return html(`<h1>TubeDrop</h1>
-<p>A connector that lets Claude upload videos to your own YouTube channel, with your own Google sign-in.</p>
-<p>Add it in Claude: <b>Customize &rarr; Connectors &rarr; Add custom connector</b>, with this URL:</p>
+<p>An MCP connector that lets compatible clients upload videos to your own YouTube channel, with your own Google sign-in.</p>
+<p>Connect an MCP client using this server URL:</p>
 <p><code>${base}/mcp</code></p>`);
 }
 
