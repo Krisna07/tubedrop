@@ -98,12 +98,13 @@ function complete(s: Session) {
   if (s.kind === "captions") { captions.push({ videoId: s.meta.snippet.videoId, data, snippet: s.meta.snippet }); return { id: id("c_") }; }
 }
 
+const ytAuth: string[] = [];   // the access token on every YouTube call, in order
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url!, "http://x");
   const p = u.pathname;
   const auth = req.headers.authorization ?? "";
   const b = await body(req);
-  log.push(`${req.method} ${p}${u.search.slice(0, 80)}`);
+  log.push(`${req.method} ${p}${u.search.slice(0, 200)}`);
   // resumable session PUTs (no auth header, like Google)
   if (p.startsWith("/session/")) {
     const s = sessions.get(p.split("/")[2]);
@@ -122,6 +123,7 @@ const server = http.createServer(async (req, res) => {
     return send(res, 308, undefined, rangeHdr());
   }
   if (!auth.startsWith("Bearer ")) return send(res, 401, { error: { message: "no auth" } });
+  if (p.includes("/youtube/")) ytAuth.push(auth.slice(7));
   if (p === "/youtube/v3/channels" && u.searchParams.get("mine") === "true") return send(res, 200, { items: [{ id: "UC2", snippet: { title: "Second Channel" } }] });
   // ---- uploads
   if (p === "/upload/drive/v3/files" && u.searchParams.get("uploadType") === "resumable") {
@@ -278,7 +280,7 @@ globalThis.fetch = (input: any, init?: any) => {
   url = url.replace("https://youtubeanalytics.googleapis.com", `http://127.0.0.1:${PORT}/yta`);
   if (url.startsWith("https://oauth2.googleapis.com") && String(init?.body).includes("authorization_code"))
     return Promise.resolve(new Response(JSON.stringify({ access_token: "new-yt-access", refresh_token: "new-yt-refresh", expires_in: 3600, scope: "https://www.googleapis.com/auth/youtube.force-ssl" }), { status: 200 }));
-  if (url.startsWith("https://oauth2.googleapis.com")) return Promise.resolve(new Response(JSON.stringify({ access_token: "fresh", expires_in: 3600 }), { status: 200 }));
+  if (url.startsWith("https://oauth2.googleapis.com")) return Promise.resolve(new Response(JSON.stringify({ access_token: "fresh:" + new URLSearchParams(String(init?.body)).get("refresh_token"), expires_in: 3600 }), { status: 200 }));
   return realFetch(url, init);
 };
 
@@ -517,14 +519,36 @@ check("switch_channel finds a channel by title", sw.active_channel_id === "UC2",
 const who2 = await call("whoami");
 check("whoami reports the newly active channel", who2.channel_id === "UC2" && who2.channel === "Second Channel", JSON.stringify(who2));
 await call("list_my_videos", {});
-const act = (await sql`SELECT yt_refresh_enc, yt_access_enc FROM users WHERE id = 'u1'`)[0];
-check("after a switch YouTube tools use the new channel's own credentials", decrypt(act.yt_refresh_enc) === "new-yt-refresh" && decrypt(act.yt_access_enc) === "fresh");
+check("after a switch YouTube tools use the new channel's own credentials", ytAuth.at(-1) === "fresh:new-yt-refresh", ytAuth.at(-1));
 const back = await call("switch_channel", { channel: "UC1" });
 check("switch_channel accepts a channel id and switches back", back.active_channel_id === "UC1");
 const bad = await call("switch_channel", { channel: "nope" }).then(() => "", (e: Error) => e.message);
 check("an unknown channel gives a helpful error", /No linked channel/.test(bad), bad);
 const stale = await GET(new Request(`https://uploader.test/google/callback?code=abc&state=${addUrl.searchParams.get("state")}`));
 check("an add-channel link cannot be reused", stale.status === 400);
+
+// ------------------------------------------------------------------ 15. Several channels at once
+// The active channel is UC1 here; `channel` picks another one for a single call without switching.
+const dThumb2 = await toDrive(thPath, "image/jpeg");
+let n = ytAuth.length;
+await Promise.all([call("list_my_videos", { channel: "UC1" }), call("list_my_videos", { channel: "Second Channel" }), call("get_video_stats", { channel: "UC2" }), call("get_video_stats", {})]);
+const used = new Set(ytAuth.slice(n));
+check("calls for different channels run at the same time, each with its own channel's token", used.size === 2 && used.has("fresh:r2") && used.has("fresh:new-yt-refresh"), [...used].join(" "));
+check("naming a channel does not change the active one", (await call("whoami")).channel_id === "UC1");
+n = ytAuth.length;
+const [upA, upB] = await Promise.all([
+  call("upload_video", { drive_file: dKeep.id, title: "To channel one", delete_from_drive: false, thumbnail_drive_file: dThumb2.id }),
+  call("upload_video", { drive_file: dKeep.id, title: "To channel two", delete_from_drive: false, thumbnail_drive_file: dThumb2.id, channel: "UC2" }),
+]);
+check("the same Drive video uploads to two channels at once", upA.status === "done" && upB.status === "done" && upA.video_id !== upB.video_id, JSON.stringify([upA.status, upB.status]));
+const jobB = (await sql`SELECT extras FROM jobs WHERE video_id = ${upB.video_id}`)[0];
+check("an upload remembers its channel, so its thumbnail goes to the same channel", jobB.extras.channel_id === "UC2" && upB.extras.some((x: string) => x.startsWith("thumbnail set")) &&
+  ytAuth.slice(n).filter((t) => t === "fresh:new-yt-refresh").length >= 2 && ytAuth.slice(n).filter((t) => t === "fresh:r2").length >= 2, ytAuth.slice(n).join(" "));
+const before = log.length;
+await call("list_comments", { channel: "second" });
+check("list_comments reads the named channel's comments", log.slice(before).some((l) => l.includes("allThreadsRelatedToChannelId=UC2")), log.slice(before).join(" | "));
+const unknown = await call("list_my_videos", { channel: "UCnope" }).then(() => "", (e: Error) => e.message);
+check("an unknown channel on any tool gives a clear error", /No linked channel/.test(unknown), unknown);
 
 const failed = results.filter((r) => !r[1]);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);

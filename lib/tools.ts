@@ -39,12 +39,12 @@ export const TOOLS = [
   },
   {
     name: "list_channels",
-    description: "List every YouTube channel linked to this connector and which one is active. All YouTube tools act on the active channel.",
+    description: "List every YouTube channel linked to this connector and which one is active. YouTube tools act on the active channel unless given a `channel`.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "switch_channel",
-    description: "Make another linked YouTube channel the active one (uploads, analytics, comments and so on then use it). Call it before working on a channel; the choice persists until changed. Accepts a channel id or its title.",
+    description: "Change the default (active) YouTube channel, used when a tool is called without `channel`. The choice persists until changed. To work on several channels at once, pass `channel` to each tool instead of switching. Accepts a channel id or its title.",
     inputSchema: { type: "object", properties: { channel: { type: "string", description: "Channel id (UC...) or title, case-insensitive." } }, required: ["channel"] },
   },
   {
@@ -88,7 +88,8 @@ export const TOOLS = [
       "uploads folder (delete_from_drive, default true). To get a local file into Drive first, use get_upload_url with kind " +
       "'drive'. Large files take several calls: if the result says " +
       "'in_progress', call continue_upload with the job_id until it says 'done'. Never make a video public without the user's " +
-      "explicit go-ahead in the conversation; default to private or a scheduled publish_at.",
+      "explicit go-ahead in the conversation; default to private or a scheduled publish_at. To put the same video on several " +
+      "channels, call this once per channel with `channel` set (the calls can run at the same time) and delete_from_drive false, so one upload does not delete the file the others need.",
     inputSchema: {
       type: "object",
       required: ["drive_file", "title"],
@@ -286,6 +287,14 @@ export const TOOLS = [
     },
   },
 ];
+
+// Tools that act on a YouTube channel take an optional `channel`, so different channels can be worked on at the same time.
+const CHANNEL_TOOLS = new Set(["upload_video", "get_upload_url", "update_video", "set_thumbnail", "add_captions", "list_my_videos", "list_playlists",
+  "create_playlist", "get_video_stats", "get_analytics", "list_comments", "reply_to_comment", "find_trending"]);
+for (const t of TOOLS) {
+  if (!CHANNEL_TOOLS.has(t.name) || t.name === "find_trending") continue;
+  (t.inputSchema.properties as Args).channel = { type: "string", description: "Which linked channel to act on: channel id (UC...) or title. Default: the active channel. Pass it explicitly when working on several channels at once." };
+}
 
 const INSTAGRAM_TOOLS = [
   {
@@ -651,9 +660,9 @@ async function pump(userId: string, jobId: string) {
 async function finish(userId: string, jobId: string, video: { id: string }) {
   const sql = await db();
   const dr = await accessToken(userId, "drive");
-  const token = await accessToken(userId, "yt");
   const job = (await sql`SELECT * FROM jobs WHERE id = ${jobId}`)[0];
   const extras = (job.extras ?? {}) as Args;
+  const token = await accessToken(userId, "yt", extras.channel_id);   // the channel the upload was started on
   const notes: string[] = [];
   const cleanup: string[] = [job.drive_id];                     // YouTube has the whole video now
   if (extras.thumbnail_drive_file) {
@@ -709,7 +718,7 @@ async function openSession(token: string, url: string, meta: unknown, mime: stri
   return session;
 }
 
-async function getUploadUrl(userId: string, a: Args) {
+async function getUploadUrl(userId: string, a: Args, chan: string | null) {
   const size = Number(a.size_bytes);
   if (!Number.isFinite(size) || size <= 0) throw new ToolError("size_bytes must be the file's exact size in bytes.");
   let url: string, meta: unknown, mime: string, token: string, what: string;
@@ -720,21 +729,21 @@ async function getUploadUrl(userId: string, a: Args) {
       const m = { snippet: snippetFrom(a), status: statusFrom(a, {}, true) } as Args;
       if (a.has_paid_product_placement !== undefined) m.paidProductPlacementDetails = { hasPaidProductPlacement: a.has_paid_product_placement };
       const parts = ["snippet", "status", ...(m.paidProductPlacementDetails ? ["paidProductPlacementDetails"] : [])].join(",");
-      url = `${YT_UP}/videos?uploadType=resumable&part=${parts}`; meta = m; token = await accessToken(userId, "yt"); what = "YouTube";
+      url = `${YT_UP}/videos?uploadType=resumable&part=${parts}`; meta = m; token = await accessToken(userId, "yt", chan); what = "YouTube";
       break;
     }
     case "thumbnail":
       if (!a.video_id) throw new ToolError("thumbnail needs video_id.");
       if (size > 2 * 1024 * 1024) throw new ToolError("Thumbnails must be 2 MB or smaller.");
       mime = a.mime ?? guessMime(a.file_name, "image/jpeg");
-      url = `${YT_UP}/thumbnails/set?videoId=${encodeURIComponent(a.video_id)}&uploadType=resumable`; meta = {}; token = await accessToken(userId, "yt"); what = "YouTube";
+      url = `${YT_UP}/thumbnails/set?videoId=${encodeURIComponent(a.video_id)}&uploadType=resumable`; meta = {}; token = await accessToken(userId, "yt", chan); what = "YouTube";
       break;
     case "captions":
       if (!a.video_id) throw new ToolError("captions needs video_id.");
       mime = a.mime ?? "application/octet-stream";
       url = `${YT_UP}/captions?part=snippet&uploadType=resumable`;
       meta = { snippet: { videoId: a.video_id, language: a.captions_language ?? "en", name: a.captions_name ?? "English", isDraft: false } };
-      token = await accessToken(userId, "yt"); what = "YouTube";
+      token = await accessToken(userId, "yt", chan); what = "YouTube";
       break;
     case "drive": {
       if (!a.file_name) throw new ToolError("drive needs file_name.");
@@ -971,9 +980,28 @@ async function syncActiveChannel(sql: Awaited<ReturnType<typeof db>>, userId: st
             WHERE id = ${userId} AND channel_id IS NOT NULL AND yt_refresh_enc IS NOT NULL ON CONFLICT DO NOTHING`;
 }
 
+/** Find one linked channel by id, exact title, or a unique part of the title. */
+async function matchChannel(sql: Awaited<ReturnType<typeof db>>, userId: string, ref: unknown) {
+  await syncActiveChannel(sql, userId);
+  const want = String(ref).trim().toLowerCase();
+  const rows = await sql`SELECT channel_id, title, yt_refresh_enc FROM channels WHERE user_id = ${userId}`;
+  let hits = rows.filter((r) => r.channel_id.toLowerCase() === want);
+  if (!hits.length) hits = rows.filter((r) => (r.title ?? "").toLowerCase() === want);
+  if (!hits.length) hits = rows.filter((r) => (r.title ?? "").toLowerCase().includes(want));
+  if (hits.length !== 1) throw new ToolError(hits.length ? `More than one channel matches "${ref}". Use the channel id.` : `No linked channel matches "${ref}". Use list_channels, or add_channel to link a new one.`);
+  return hits[0];
+}
+
+async function resolveChannel(sql: Awaited<ReturnType<typeof db>>, userId: string, ref: unknown): Promise<string | null> {
+  if (ref !== undefined && ref !== null && String(ref).trim()) return (await matchChannel(sql, userId, ref)).channel_id;
+  return (await sql`SELECT channel_id FROM users WHERE id = ${userId}`)[0]?.channel_id ?? null;
+}
+
 export async function callTool(userId: string, name: string, a: Args, req: Request): Promise<unknown> {
   const sql = await db();
   if (name.startsWith("instagram_") && !instagramEnabled()) throw new ToolError("Instagram is not set up on this server (META_ACCESS_TOKEN is missing).");
+  // Which linked channel this call is for: the one named in `channel`, else the active one.
+  const chan = CHANNEL_TOOLS.has(name) ? await resolveChannel(sql, userId, a.channel) : null;
   switch (name) {
     case "list_channels": {
       await syncActiveChannel(sql, userId);
@@ -983,14 +1011,8 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
     }
     case "switch_channel": {
       await syncActiveChannel(sql, userId);
-      const want = String(a.channel ?? "").trim().toLowerCase();
-      if (!want) throw new ToolError("Give a channel id or title. Use list_channels to see them.");
-      const rows = await sql`SELECT channel_id, title, yt_refresh_enc FROM channels WHERE user_id = ${userId}`;
-      let hits = rows.filter((r) => r.channel_id.toLowerCase() === want);
-      if (!hits.length) hits = rows.filter((r) => (r.title ?? "").toLowerCase() === want);
-      if (!hits.length) hits = rows.filter((r) => (r.title ?? "").toLowerCase().includes(want));
-      if (hits.length !== 1) throw new ToolError(hits.length ? `More than one channel matches "${a.channel}". Use the channel id.` : `No linked channel matches "${a.channel}". Use list_channels, or add_channel to link a new one.`);
-      const c = hits[0];
+      if (!String(a.channel ?? "").trim()) throw new ToolError("Give a channel id or title. Use list_channels to see them.");
+      const c = await matchChannel(sql, userId, a.channel);
       await sql`UPDATE users SET yt_refresh_enc = ${c.yt_refresh_enc}, yt_access_enc = NULL, yt_expiry = NULL, channel_id = ${c.channel_id}, channel_title = ${c.title}, updated_at = now() WHERE id = ${userId}`;
       return { active_channel_id: c.channel_id, title: c.title, note: "Channel switched. It stays active until you switch again." };
     }
@@ -1036,7 +1058,7 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
       return files.map((f) => ({ ...f, size_mb: f.size ? Math.round(Number(f.size) / 1048576 * 10) / 10 : null }));
     }
     case "upload_video": {
-      const token = await accessToken(userId, "yt");
+      const token = await accessToken(userId, "yt", chan);
       const id = driveId(a.drive_file);
       const file = await driveMeta(await accessToken(userId, "drive"), id);
       if (!file.mimeType.startsWith("video/")) throw new ToolError(`${file.name} is ${file.mimeType}, not a video.`);
@@ -1061,7 +1083,7 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
       const jobId = "job_" + randomId(9);
       const extras = {
         thumbnail_drive_file: a.thumbnail_drive_file, captions_drive_file: a.captions_drive_file,
-        captions_language: a.captions_language ?? "en", captions_name: a.captions_name ?? "English", playlist_id: a.playlist_id,
+        captions_language: a.captions_language ?? "en", captions_name: a.captions_name ?? "English", playlist_id: a.playlist_id, channel_id: chan,
         delete_from_drive: a.delete_from_drive !== false,
       };
       await sql`INSERT INTO jobs (id, user_id, drive_id, session_uri_enc, total, uploaded, mime, meta, extras, status)
@@ -1072,11 +1094,11 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
     case "import_from_github":
       return startImport(userId, a);
     case "get_upload_url":
-      return getUploadUrl(userId, a);
+      return getUploadUrl(userId, a, chan);
     case "continue_upload":
       return pump(userId, a.job_id);
     case "update_video": {
-      const token = await accessToken(userId);
+      const token = await accessToken(userId, "yt", chan);
       const cur = await gjson<{ items: Args[] }>(token, `${YT}/videos?part=snippet,status&id=${encodeURIComponent(a.video_id)}`);
       const v = cur.items?.[0];
       if (!v) throw new ToolError(`Video ${a.video_id} was not found on this channel.`);
@@ -1091,14 +1113,14 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
       return { video_id: r.id, title: r.snippet?.title, privacy: r.status?.privacyStatus, publish_at: r.status?.publishAt ?? null, url: watchUrl(r.id) };
     }
     case "set_thumbnail": {
-      const token = await accessToken(userId);
+      const token = await accessToken(userId, "yt", chan);
       const dr = await accessToken(userId, "drive");
       const out: Args = { ok: true, thumbnail: await setThumbnail(dr, token, a.video_id, a.drive_file) };
       if (a.delete_from_drive !== false) out.drive = await deleteIfOurs(dr, a.drive_file);
       return out;
     }
     case "add_captions": {
-      const token = await accessToken(userId);
+      const token = await accessToken(userId, "yt", chan);
       const dr = await accessToken(userId, "drive");
       const out: Args = { ok: true, captions: await addCaptions(dr, token, a.video_id, a.drive_file, a.language, a.name) };
       if (a.delete_from_drive !== false) out.drive = await deleteIfOurs(dr, a.drive_file);
@@ -1109,7 +1131,7 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
     case "sketchfab_save_model":
       return sketchfabSave(a);
     case "list_my_videos": {
-      const token = await accessToken(userId);
+      const token = await accessToken(userId, "yt", chan);
       const ch = await gjson<{ items: Args[] }>(token, `${YT}/channels?part=contentDetails&mine=true`);
       const uploads = ch.items?.[0]?.contentDetails?.relatedPlaylists?.uploads;
       if (!uploads) return [];
@@ -1124,12 +1146,12 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
       }));
     }
     case "list_playlists": {
-      const token = await accessToken(userId);
+      const token = await accessToken(userId, "yt", chan);
       const r = await gjson<{ items: Args[] }>(token, `${YT}/playlists?part=snippet,status&mine=true&maxResults=50`);
       return (r.items ?? []).map((p) => ({ playlist_id: p.id, title: p.snippet.title, privacy: p.status.privacyStatus }));
     }
     case "create_playlist": {
-      const token = await accessToken(userId);
+      const token = await accessToken(userId, "yt", chan);
       const r = await gjson<Args>(token, `${YT}/playlists?part=snippet,status`, {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ snippet: { title: a.title, description: a.description ?? "" }, status: { privacyStatus: a.privacy ?? "public" } }),
@@ -1137,7 +1159,7 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
       return { playlist_id: r.id, title: r.snippet.title };
     }
     case "get_video_stats": {
-      const token = await accessToken(userId);
+      const token = await accessToken(userId, "yt", chan);
       let ids: string[] = Array.isArray(a.video_ids) ? a.video_ids.map(String).filter(Boolean) : [];
       if (ids.length > 50) throw new ToolError("Pass at most 50 video_ids.");
       if (!ids.length) ids = await recentUploadIds(token, Math.min(50, Math.max(1, Number(a.max ?? 25))));
@@ -1146,11 +1168,11 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
       return ids.map((id) => details.get(id)).filter(Boolean).map((v) => statsRow(v as Args));
     }
     case "get_analytics":
-      return getAnalytics(await accessToken(userId), a);
+      return getAnalytics(await accessToken(userId, "yt", chan), a);
     case "find_trending":
-      return findTrending(await accessToken(userId), a);
+      return findTrending(await accessToken(userId, "yt", chan), a);
     case "list_comments": {
-      const token = await accessToken(userId);
+      const token = await accessToken(userId, "yt", chan);
       const max = Math.min(100, Math.max(1, Number(a.max ?? 50)));
       const u = new URL(`${YT}/commentThreads`);
       u.searchParams.set("part", "snippet,replies");
@@ -1159,12 +1181,12 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
       u.searchParams.set("textFormat", "plainText");
       if (a.video_id) u.searchParams.set("videoId", String(a.video_id));
       else {
-        const row = (await (await db())`SELECT channel_id FROM users WHERE id = ${userId}`)[0];
+        const row = { channel_id: chan };
         if (!row?.channel_id) throw new ToolError("No YouTube channel is linked. Reconnect TubeDrop in Claude's settings.");
         u.searchParams.set("allThreadsRelatedToChannelId", row.channel_id);
       }
       const r = await gjson<{ items?: Args[] }>(token, u.toString());
-      const own = (await (await db())`SELECT channel_id FROM users WHERE id = ${userId}`)[0]?.channel_id;
+      const own = chan;
       const rows = (r.items ?? []).map((t) => {
         const c = t.snippet?.topLevelComment?.snippet ?? {};
         const replies: Args[] = t.replies?.comments ?? [];
@@ -1184,7 +1206,7 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
       if (!text) throw new ToolError("text is empty.");
       if (text.length > 1000) throw new ToolError("Keep the reply under 1,000 characters.");
       if (!a.comment_id) throw new ToolError("comment_id is required.");
-      const token = await accessToken(userId);
+      const token = await accessToken(userId, "yt", chan);
       const r = await gjson<Args>(token, `${YT}/comments?part=snippet`, {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ snippet: { parentId: String(a.comment_id), textOriginal: text } }),

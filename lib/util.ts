@@ -85,6 +85,8 @@ async function migrate(s: any) {
     await s`CREATE TABLE IF NOT EXISTS channels (user_id text NOT NULL, channel_id text NOT NULL, title text, yt_refresh_enc text NOT NULL, created_at timestamptz DEFAULT now(), PRIMARY KEY (user_id, channel_id))`;
     await s`INSERT INTO channels (user_id, channel_id, title, yt_refresh_enc) SELECT id, channel_id, channel_title, yt_refresh_enc FROM users
             WHERE channel_id IS NOT NULL AND yt_refresh_enc IS NOT NULL ON CONFLICT DO NOTHING`;
+    await s`ALTER TABLE channels ADD COLUMN IF NOT EXISTS yt_access_enc text`;
+    await s`ALTER TABLE channels ADD COLUMN IF NOT EXISTS yt_expiry timestamptz`;
   }
 }
 

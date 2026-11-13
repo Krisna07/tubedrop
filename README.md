@@ -134,7 +134,9 @@ Reel specs: MP4 or MOV, H.264 or HEVC, AAC audio, 3 seconds to 15 minutes, 9:16 
 
 ## Several channels
 
-One connector can run several channels (for example one per niche). `add_channel` returns a Google sign-in link; open it and pick the channel or brand account to add. `list_channels` shows them, and `switch_channel` (by id or title) chooses which one every YouTube tool acts on. The choice persists until you switch again, so a scheduled task should call `switch_channel` first. Accounts linked before this feature are picked up automatically.
+One connector can run several channels (for example one per niche). `add_channel` returns a Google sign-in link; open it and pick the channel or brand account to add. `list_channels` shows them.
+
+Every YouTube tool takes an optional `channel` (id or title), so different channels can be worked on at the same time: two scheduled tasks can each upload to their own channel, or one video can go to several channels with one `upload_video` call per channel (pass `delete_from_drive: false` so the first upload does not delete the file the others need). An upload remembers its channel, so `continue_upload`, the thumbnail and the captions all go to the same place. Without `channel`, tools use the default channel, which `switch_channel` changes. Scheduled tasks should always pass `channel`.
 
 ## Comments
 

@@ -2,17 +2,7 @@ import { db, decrypt, encrypt, env } from "./util.js";
 
 export class ToolError extends Error {}
 
-/** kind "drive" = the personal Google account; kind "yt" = the account/brand channel picked for YouTube. */
-export async function accessToken(userId: string, kind: "yt" | "drive" = "yt"): Promise<string> {
-  const sql = await db();
-  const rows = await sql`SELECT * FROM users WHERE id = ${userId}`;
-  const u = rows[0];
-  if (!u) throw new ToolError("No Google account is linked. Reconnect the connector in Claude's settings.");
-  const useYt = kind === "yt" && !!u.yt_refresh_enc;
-  const refreshEnc = useYt ? u.yt_refresh_enc : u.google_refresh_enc;
-  const accessEnc = useYt ? u.yt_access_enc : u.google_access_enc;
-  const expiry = useYt ? u.yt_expiry : u.google_expiry;
-  if (accessEnc && expiry && new Date(expiry) > new Date()) return decrypt(accessEnc);
+async function refreshGoogle(refreshEnc: string): Promise<{ token: string; enc: string; exp: string }> {
   const r = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -27,11 +17,41 @@ export async function accessToken(userId: string, kind: "yt" | "drive" = "yt"): 
   if (!r.ok || !t.access_token) {
     throw new ToolError(`Google sign-in has expired (${t.error ?? r.status}). Disconnect and reconnect the connector in Claude's settings.`);
   }
-  const enc = encrypt(t.access_token);
-  const exp = new Date(Date.now() + (t.expires_in ?? 3600) * 1000 - 60000).toISOString();
-  if (useYt) await sql`UPDATE users SET yt_access_enc = ${enc}, yt_expiry = ${exp}, updated_at = now() WHERE id = ${userId}`;
-  else await sql`UPDATE users SET google_access_enc = ${enc}, google_expiry = ${exp}, updated_at = now() WHERE id = ${userId}`;
-  return t.access_token;
+  return { token: t.access_token, enc: encrypt(t.access_token), exp: new Date(Date.now() + (t.expires_in ?? 3600) * 1000 - 60000).toISOString() };
+}
+
+const live = (accessEnc: unknown, expiry: unknown) => !!accessEnc && !!expiry && new Date(expiry as string) > new Date();
+
+/**
+ * kind "drive" = the personal Google account; kind "yt" = a linked YouTube channel.
+ * channelId picks which linked channel; without it the active one (users.channel_id) is used.
+ * Each channel caches its own access token, so calls for different channels never share one.
+ */
+export async function accessToken(userId: string, kind: "yt" | "drive" = "yt", channelId?: string | null): Promise<string> {
+  const sql = await db();
+  const rows = await sql`SELECT * FROM users WHERE id = ${userId}`;
+  const u = rows[0];
+  if (!u) throw new ToolError("No Google account is linked. Reconnect the connector in Claude's settings.");
+  if (kind === "yt") {
+    const cid = channelId ?? u.channel_id;
+    const c = cid ? (await sql`SELECT * FROM channels WHERE user_id = ${userId} AND channel_id = ${cid}`)[0] : undefined;
+    if (channelId && !c && channelId !== u.channel_id) throw new ToolError(`Channel ${channelId} is not linked to this connector. Use list_channels.`);
+    if (c) {
+      if (live(c.yt_access_enc, c.yt_expiry)) return decrypt(c.yt_access_enc);
+      const f = await refreshGoogle(c.yt_refresh_enc);
+      await sql`UPDATE channels SET yt_access_enc = ${f.enc}, yt_expiry = ${f.exp} WHERE user_id = ${userId} AND channel_id = ${cid}`;
+      return f.token;
+    }
+  }
+  // Drive, or an account linked before channels had their own rows.
+  const useYt = kind === "yt" && !!u.yt_refresh_enc;
+  const refreshEnc = useYt ? u.yt_refresh_enc : u.google_refresh_enc;
+  if (live(useYt ? u.yt_access_enc : u.google_access_enc, useYt ? u.yt_expiry : u.google_expiry)) return decrypt(useYt ? u.yt_access_enc : u.google_access_enc);
+  const f = await refreshGoogle(refreshEnc);
+  // Only cache against the refresh token that produced it, so a concurrent change cannot be given the wrong token.
+  if (useYt) await sql`UPDATE users SET yt_access_enc = ${f.enc}, yt_expiry = ${f.exp}, updated_at = now() WHERE id = ${userId} AND yt_refresh_enc = ${refreshEnc}`;
+  else await sql`UPDATE users SET google_access_enc = ${f.enc}, google_expiry = ${f.exp}, updated_at = now() WHERE id = ${userId} AND google_refresh_enc = ${refreshEnc}`;
+  return f.token;
 }
 
 export async function gfetch(token: string, url: string, init: RequestInit = {}): Promise<Response> {
