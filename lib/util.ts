@@ -80,7 +80,12 @@ async function migrate(s: any) {
     await s`ALTER TABLE users ADD COLUMN IF NOT EXISTS yt_refresh_enc text`;
     await s`ALTER TABLE users ADD COLUMN IF NOT EXISTS yt_access_enc text`;
     await s`ALTER TABLE users ADD COLUMN IF NOT EXISTS yt_expiry timestamptz`;
-    await s`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS kind text`;  }
+    await s`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS kind text`;
+    // One row per YouTube channel a user has linked. users.yt_* / channel_* always mirror the ACTIVE channel.
+    await s`CREATE TABLE IF NOT EXISTS channels (user_id text NOT NULL, channel_id text NOT NULL, title text, yt_refresh_enc text NOT NULL, created_at timestamptz DEFAULT now(), PRIMARY KEY (user_id, channel_id))`;
+    await s`INSERT INTO channels (user_id, channel_id, title, yt_refresh_enc) SELECT id, channel_id, channel_title, yt_refresh_enc FROM users
+            WHERE channel_id IS NOT NULL AND yt_refresh_enc IS NOT NULL ON CONFLICT DO NOTHING`;
+  }
 }
 
 // ---------------------------------------------------------------- http

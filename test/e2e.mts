@@ -47,6 +47,21 @@ const sessions = new Map<string, Session>();
 const log: string[] = [];
 let failNextSessionPut = 0;
 let analyticsMode: "ok" | "no-scope" | "disabled" = "ok";
+let searchQuota: "ok" | "exceeded" = "ok";
+const searchQueries: Record<string, string>[] = [];
+const chartQueries: Record<string, string>[] = [];
+const hoursAgo = (h: number) => new Date(Date.now() - h * 3600e3).toISOString();
+// Other creators' videos that the platform-wide search and chart return.
+const trendingVideos = [
+  { id: "tr_new", title: "Small but brand new #shorts", channel: "Chan A", published: hoursAgo(2), views: 4000, dur: "PT30S" },     // 2000 views/hour
+  { id: "tr_big", title: "Huge but older #shorts", channel: "Chan B", published: hoursAgo(100), views: 50000, dur: "PT45S" },      // 500 views/hour
+  { id: "tr_long", title: "Ten minute documentary", channel: "Chan C", published: hoursAgo(5), views: 90000, dur: "PT10M" },       // not a Short
+  { id: "tr_stale", title: "Viral last month #shorts", channel: "Chan D", published: hoursAgo(24 * 12), views: 900000, dur: "PT20S" }, // outside 7 days
+];
+const trendingItem = (t: (typeof trendingVideos)[number]) => ({
+  id: t.id, snippet: { title: t.title, channelTitle: t.channel, channelId: "UC_" + t.channel, publishedAt: t.published },
+  status: { privacyStatus: "public" }, statistics: { viewCount: String(t.views), likeCount: "10", commentCount: "2" }, contentDetails: { duration: t.dur },
+});
 const analyticsQueries: Record<string, string>[] = [];
 const commentQueries: Record<string, string>[] = [];
 const postedReplies: any[] = [];
@@ -107,6 +122,7 @@ const server = http.createServer(async (req, res) => {
     return send(res, 308, undefined, rangeHdr());
   }
   if (!auth.startsWith("Bearer ")) return send(res, 401, { error: { message: "no auth" } });
+  if (p === "/youtube/v3/channels" && u.searchParams.get("mine") === "true") return send(res, 200, { items: [{ id: "UC2", snippet: { title: "Second Channel" } }] });
   // ---- uploads
   if (p === "/upload/drive/v3/files" && u.searchParams.get("uploadType") === "resumable") {
     const meta = JSON.parse(b.toString());
@@ -156,6 +172,18 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, { id: f.id, name: f.name, mimeType: f.mimeType, size: String(f.data.length), parents: f.parents });
   }
   // ---- YouTube data API
+  if (p === "/youtube/v3/search" && req.method === "GET") {
+    searchQueries.push(Object.fromEntries(u.searchParams));
+    if (searchQuota === "exceeded") return send(res, 403, { error: { code: 403, message: "The request cannot be completed because you have exceeded your quota.", errors: [{ reason: "quotaExceeded" }] } });
+    return send(res, 200, { items: trendingVideos.map((t) => ({ id: { kind: "youtube#video", videoId: t.id }, snippet: { title: t.title } })) });
+  }
+  if (p === "/youtube/v3/videos" && req.method === "GET" && u.searchParams.get("chart") === "mostPopular") {
+    chartQueries.push(Object.fromEntries(u.searchParams));
+    return send(res, 200, { items: trendingVideos.map(trendingItem) });
+  }
+  if (p === "/youtube/v3/videos" && req.method === "GET" && (u.searchParams.get("id") ?? "").split(",").some((x) => x.startsWith("tr_"))) {
+    return send(res, 200, { items: (u.searchParams.get("id") ?? "").split(",").map((x) => trendingVideos.find((t) => t.id === x)).filter(Boolean).map((t) => trendingItem(t!)) });
+  }
   if (p === "/youtube/v3/videos" && req.method === "GET") {
     const found = (u.searchParams.get("id") ?? "").split(",").map((x) => videos.get(x)).filter(Boolean) as { id: string; snippet: any; status: any; data: Buffer }[];
     return send(res, 200, { items: found.map((v) => ({ id: v.id, snippet: { ...v.snippet, publishedAt: "2026-11-01T09:00:00Z" }, status: v.status,
@@ -248,13 +276,15 @@ globalThis.fetch = (input: any, init?: any) => {
   if (url.startsWith("https://graph.facebook.com/")) return fakeMeta(url, init);
   url = url.replace("https://www.googleapis.com", `http://127.0.0.1:${PORT}`);
   url = url.replace("https://youtubeanalytics.googleapis.com", `http://127.0.0.1:${PORT}/yta`);
+  if (url.startsWith("https://oauth2.googleapis.com") && String(init?.body).includes("authorization_code"))
+    return Promise.resolve(new Response(JSON.stringify({ access_token: "new-yt-access", refresh_token: "new-yt-refresh", expires_in: 3600, scope: "https://www.googleapis.com/auth/youtube.force-ssl" }), { status: 200 }));
   if (url.startsWith("https://oauth2.googleapis.com")) return Promise.resolve(new Response(JSON.stringify({ access_token: "fresh", expires_in: 3600 }), { status: 200 }));
   return realFetch(url, init);
 };
 
 // ------------------------------------------------------------------ the server under test
 const { POST, GET } = await import(pathToFileURL(`${ROOT}/api/index.ts`).href);
-const { db, encrypt, sha256 } = await import(pathToFileURL(`${ROOT}/lib/util.ts`).href);
+const { db, decrypt, encrypt, sha256 } = await import(pathToFileURL(`${ROOT}/lib/util.ts`).href);
 serverGET = GET;
 const sql = await db();
 const exp = new Date(Date.now() + 3600e3).toISOString();
@@ -447,6 +477,54 @@ check("unanswered_only filters and video_id narrows", openC.length === 1 && comm
 check("reply needs user_confirmed", (await refusedCall("reply_to_comment", { comment_id: "c1", text: "Thanks!" })).includes("user_confirmed"));
 const rep = await call("reply_to_comment", { comment_id: "c1", text: "Thanks for watching!", user_confirmed: true });
 check("reply posts under the parent comment", rep.reply_id === "r_1" && postedReplies[0].snippet.parentId === "c1" && postedReplies[0].snippet.textOriginal === "Thanks for watching!");
+
+// ------------------------------------------------------------------ 13. Platform-wide trending
+const trend = await call("find_trending", { query: "couple argument", category_id: "23", region_code: "au" });
+const sq = searchQueries.at(-1)!;
+check("find_trending searches recent videos by view count, Shorts only", sq.type === "video" && sq.order === "viewCount" && sq.videoDuration === "short" &&
+  sq.q === "couple argument" && sq.videoCategoryId === "23" && sq.regionCode === "AU", JSON.stringify(sq));
+check("find_trending looks back 7 days by default", Math.abs(Date.now() - new Date(sq.publishedAfter).getTime() - 7 * 86400e3) < 60e3);
+check("find_trending ranks by views per hour, not total views", trend.items[0]?.video_id === "tr_new" && trend.items[1]?.video_id === "tr_big" &&
+  trend.items[0].views_per_hour > trend.items[1].views_per_hour, trend.items.map((i: any) => `${i.video_id}:${i.views_per_hour}`).join(" "));
+check("find_trending drops non-Shorts and videos outside the window", trend.items.length === 2, trend.items.map((i: any) => i.video_id).join(","));
+check("find_trending items carry channel, link and Short flag", trend.items[0].channel === "Chan A" && trend.items[0].url === "https://youtu.be/tr_new" && trend.items[0].is_short === true);
+check("find_trending reports the quota it used", trend.quota_cost === 101);
+const longToo = await call("find_trending", { shorts_only: false, published_within_days: 30 });
+check("shorts_only:false keeps long videos; a 30-day window keeps older ones", longToo.items.length === 4 && "videoDuration" in searchQueries.at(-1)! === false, longToo.items.map((i: any) => i.video_id).join(","));
+const capped = await call("find_trending", { max: 1 });
+check("max limits the number returned", capped.items.length === 1);
+const pop = await call("find_trending", { mode: "popular" });
+check("popular mode reads the most-popular chart for the US by default for 1 unit", chartQueries.at(-1)!.chart === "mostPopular" && chartQueries.at(-1)!.regionCode === "US" &&
+  pop.quota_cost === 1 && pop.items[0].video_id === "tr_new" && pop.items.length === 2, JSON.stringify(chartQueries.at(-1)));
+check("find_trending refuses a bad region code", (await refusedCall("find_trending", { region_code: "Australia" })).includes("two-letter"));
+check("find_trending refuses an unknown mode", (await refusedCall("find_trending", { mode: "hot" })).includes("mode"));
+searchQuota = "exceeded";
+check("exhausted quota gives a clear message and points to popular mode", (await refusedCall("find_trending", {})).includes("popular"));
+searchQuota = "ok";
+
+// ------------------------------------------------------------------ 14. Multiple channels
+const ch0 = await call("list_channels");
+check("existing single-channel users are migrated into the channels table", ch0.channels.length === 1 && ch0.channels[0].channel_id === "UC1" && ch0.channels[0].active === true, JSON.stringify(ch0));
+const added = await call("add_channel");
+const addUrl = new URL(added.sign_in_url);
+check("add_channel returns a Google sign-in URL asking for YouTube access", addUrl.hostname === "accounts.google.com" && addUrl.searchParams.get("scope")!.includes("youtube.force-ssl"), added.sign_in_url);
+const cb = await GET(new Request(`https://uploader.test/google/callback?code=abc&state=${addUrl.searchParams.get("state")}`));
+check("the add-channel callback links the channel without touching the OAuth flow", cb.status === 200 && (await cb.text()).includes("Channel added"), String(cb.status));
+const ch1 = await call("list_channels");
+check("the new channel is listed and the active one is unchanged", ch1.channels.length === 2 && ch1.active_channel_id === "UC1" && ch1.channels.find((c: any) => c.channel_id === "UC2")?.title === "Second Channel", JSON.stringify(ch1));
+const sw = await call("switch_channel", { channel: "second channel" });
+check("switch_channel finds a channel by title", sw.active_channel_id === "UC2", JSON.stringify(sw));
+const who2 = await call("whoami");
+check("whoami reports the newly active channel", who2.channel_id === "UC2" && who2.channel === "Second Channel", JSON.stringify(who2));
+await call("list_my_videos", {});
+const act = (await sql`SELECT yt_refresh_enc, yt_access_enc FROM users WHERE id = 'u1'`)[0];
+check("after a switch YouTube tools use the new channel's own credentials", decrypt(act.yt_refresh_enc) === "new-yt-refresh" && decrypt(act.yt_access_enc) === "fresh");
+const back = await call("switch_channel", { channel: "UC1" });
+check("switch_channel accepts a channel id and switches back", back.active_channel_id === "UC1");
+const bad = await call("switch_channel", { channel: "nope" }).then(() => "", (e: Error) => e.message);
+check("an unknown channel gives a helpful error", /No linked channel/.test(bad), bad);
+const stale = await GET(new Request(`https://uploader.test/google/callback?code=abc&state=${addUrl.searchParams.get("state")}`));
+check("an add-channel link cannot be reused", stale.status === 400);
 
 const failed = results.filter((r) => !r[1]);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
