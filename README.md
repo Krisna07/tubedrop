@@ -132,9 +132,15 @@ Reel specs: MP4 or MOV, H.264 or HEVC, AAC audio, 3 seconds to 15 minutes, 9:16 
 
 `find_trending` asks YouTube's own Data API what is taking off, not blog posts. `mode: "search"` (default) finds videos from the last N days (1 to 30, default 7), Shorts only by default, optionally for a `query`, `region_code` or `category_id`, and ranks them by views per hour so a fresh video beats an old giant. It costs 100 quota units per call (the daily default is 10,000). `mode: "popular"` reads YouTube's most-popular chart for 1 unit.
 
+## Gaps: watched a lot, covered little
+
+`find_gaps` looks for topics (shows, films, games) with high demand and little creator coverage. YouTube does not publish search volume, so demand is the biggest recent video on the topic (usually the official trailer) and supply is the number of original videos among the top 50 results, ignoring trailer re-uploads and dubs. Pass `topics`, or leave it out to take candidates from the most-popular chart. Each topic costs 100 quota units. Demand with many views and almost no likes is flagged as likely paid promotion and marked down.
+
 ## Several channels
 
-One connector can run several channels (for example one per niche). `add_channel` returns a Google sign-in link; open it and pick the channel or brand account to add. `list_channels` shows them, and `switch_channel` (by id or title) chooses which one every YouTube tool acts on. The choice persists until you switch again, so a scheduled task should call `switch_channel` first. Accounts linked before this feature are picked up automatically.
+One connector can run several channels (for example one per niche). `add_channel` returns a Google sign-in link; open it and pick the channel or brand account to add. `list_channels` shows them.
+
+Every YouTube tool takes an optional `channel` (id or title), so different channels can be worked on at the same time: two scheduled tasks can each upload to their own channel, or one video can go to several channels with one `upload_video` call per channel (pass `delete_from_drive: false` so the first upload does not delete the file the others need). An upload remembers its channel, so `continue_upload`, the thumbnail and the captions all go to the same place. Without `channel`, tools use the default channel, which `switch_channel` changes. Scheduled tasks should always pass `channel`.
 
 ## Comments
 

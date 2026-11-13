@@ -62,6 +62,15 @@ const trendingItem = (t: (typeof trendingVideos)[number]) => ({
   id: t.id, snippet: { title: t.title, channelTitle: t.channel, channelId: "UC_" + t.channel, publishedAt: t.published },
   status: { privacyStatus: "public" }, statistics: { viewCount: String(t.views), likeCount: "10", commentCount: "2" }, contentDetails: { duration: t.dur },
 });
+// Topics for the demand-vs-supply check: an open gap, a crowded topic and a promoted one.
+const gapVideos = [
+  { q: "Open Show", id: "gp_o1", title: "Open Show | Official Trailer", channel: "Studio", published: hoursAgo(10), views: 1000000, likes: 20000, dur: "PT2M" },
+  { q: "Open Show", id: "gp_o2", title: "OPEN SHOW Tráiler Español", channel: "Dubs", published: hoursAgo(9), views: 50000, likes: 900, dur: "PT2M" },
+  { q: "Open Show", id: "gp_o3", title: "Why Open Show changes everything", channel: "Fan", published: hoursAgo(8), views: 300000, likes: 9000, dur: "PT50S" },
+  { q: "Busy Show", id: "gp_b1", title: "Busy Show | Official Trailer", channel: "Studio", published: hoursAgo(10), views: 1000000, likes: 20000, dur: "PT2M" },
+  ...Array.from({ length: 9 }, (_, i) => ({ q: "Busy Show", id: `gp_b${i + 2}`, title: `Busy Show explained part ${i + 1}`, channel: "Fan " + i, published: hoursAgo(8), views: 1000 * (i + 1), likes: 30, dur: "PT50S" })),
+  { q: "Paid Show", id: "gp_p1", title: "Paid Show | Official Trailer", channel: "Studio", published: hoursAgo(10), views: 3000000, likes: 500, dur: "PT2M" },
+];
 const analyticsQueries: Record<string, string>[] = [];
 const commentQueries: Record<string, string>[] = [];
 const postedReplies: any[] = [];
@@ -98,12 +107,13 @@ function complete(s: Session) {
   if (s.kind === "captions") { captions.push({ videoId: s.meta.snippet.videoId, data, snippet: s.meta.snippet }); return { id: id("c_") }; }
 }
 
+const ytAuth: string[] = [];   // the access token on every YouTube call, in order
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url!, "http://x");
   const p = u.pathname;
   const auth = req.headers.authorization ?? "";
   const b = await body(req);
-  log.push(`${req.method} ${p}${u.search.slice(0, 80)}`);
+  log.push(`${req.method} ${p}${u.search.slice(0, 200)}`);
   // resumable session PUTs (no auth header, like Google)
   if (p.startsWith("/session/")) {
     const s = sessions.get(p.split("/")[2]);
@@ -122,6 +132,7 @@ const server = http.createServer(async (req, res) => {
     return send(res, 308, undefined, rangeHdr());
   }
   if (!auth.startsWith("Bearer ")) return send(res, 401, { error: { message: "no auth" } });
+  if (p.includes("/youtube/")) ytAuth.push(auth.slice(7));
   if (p === "/youtube/v3/channels" && u.searchParams.get("mine") === "true") return send(res, 200, { items: [{ id: "UC2", snippet: { title: "Second Channel" } }] });
   // ---- uploads
   if (p === "/upload/drive/v3/files" && u.searchParams.get("uploadType") === "resumable") {
@@ -175,11 +186,17 @@ const server = http.createServer(async (req, res) => {
   if (p === "/youtube/v3/search" && req.method === "GET") {
     searchQueries.push(Object.fromEntries(u.searchParams));
     if (searchQuota === "exceeded") return send(res, 403, { error: { code: 403, message: "The request cannot be completed because you have exceeded your quota.", errors: [{ reason: "quotaExceeded" }] } });
+    const gq = gapVideos.filter((g) => g.q === u.searchParams.get("q"));
+    if (gq.length) return send(res, 200, { items: gq.map((t) => ({ id: { kind: "youtube#video", videoId: t.id }, snippet: { title: t.title } })) });
     return send(res, 200, { items: trendingVideos.map((t) => ({ id: { kind: "youtube#video", videoId: t.id }, snippet: { title: t.title } })) });
   }
   if (p === "/youtube/v3/videos" && req.method === "GET" && u.searchParams.get("chart") === "mostPopular") {
     chartQueries.push(Object.fromEntries(u.searchParams));
     return send(res, 200, { items: trendingVideos.map(trendingItem) });
+  }
+  if (p === "/youtube/v3/videos" && req.method === "GET" && (u.searchParams.get("id") ?? "").split(",").some((x) => x.startsWith("gp_"))) {
+    return send(res, 200, { items: (u.searchParams.get("id") ?? "").split(",").map((x) => gapVideos.find((t) => t.id === x)).filter(Boolean)
+      .map((t) => ({ ...trendingItem(t as any), statistics: { viewCount: String(t!.views), likeCount: String(t!.likes), commentCount: "1" } })) });
   }
   if (p === "/youtube/v3/videos" && req.method === "GET" && (u.searchParams.get("id") ?? "").split(",").some((x) => x.startsWith("tr_"))) {
     return send(res, 200, { items: (u.searchParams.get("id") ?? "").split(",").map((x) => trendingVideos.find((t) => t.id === x)).filter(Boolean).map((t) => trendingItem(t!)) });
@@ -278,7 +295,7 @@ globalThis.fetch = (input: any, init?: any) => {
   url = url.replace("https://youtubeanalytics.googleapis.com", `http://127.0.0.1:${PORT}/yta`);
   if (url.startsWith("https://oauth2.googleapis.com") && String(init?.body).includes("authorization_code"))
     return Promise.resolve(new Response(JSON.stringify({ access_token: "new-yt-access", refresh_token: "new-yt-refresh", expires_in: 3600, scope: "https://www.googleapis.com/auth/youtube.force-ssl" }), { status: 200 }));
-  if (url.startsWith("https://oauth2.googleapis.com")) return Promise.resolve(new Response(JSON.stringify({ access_token: "fresh", expires_in: 3600 }), { status: 200 }));
+  if (url.startsWith("https://oauth2.googleapis.com")) return Promise.resolve(new Response(JSON.stringify({ access_token: "fresh:" + new URLSearchParams(String(init?.body)).get("refresh_token"), expires_in: 3600 }), { status: 200 }));
   return realFetch(url, init);
 };
 
@@ -517,14 +534,51 @@ check("switch_channel finds a channel by title", sw.active_channel_id === "UC2",
 const who2 = await call("whoami");
 check("whoami reports the newly active channel", who2.channel_id === "UC2" && who2.channel === "Second Channel", JSON.stringify(who2));
 await call("list_my_videos", {});
-const act = (await sql`SELECT yt_refresh_enc, yt_access_enc FROM users WHERE id = 'u1'`)[0];
-check("after a switch YouTube tools use the new channel's own credentials", decrypt(act.yt_refresh_enc) === "new-yt-refresh" && decrypt(act.yt_access_enc) === "fresh");
+check("after a switch YouTube tools use the new channel's own credentials", ytAuth.at(-1) === "fresh:new-yt-refresh", ytAuth.at(-1));
 const back = await call("switch_channel", { channel: "UC1" });
 check("switch_channel accepts a channel id and switches back", back.active_channel_id === "UC1");
 const bad = await call("switch_channel", { channel: "nope" }).then(() => "", (e: Error) => e.message);
 check("an unknown channel gives a helpful error", /No linked channel/.test(bad), bad);
 const stale = await GET(new Request(`https://uploader.test/google/callback?code=abc&state=${addUrl.searchParams.get("state")}`));
 check("an add-channel link cannot be reused", stale.status === 400);
+
+// ------------------------------------------------------------------ 15. Several channels at once
+// The active channel is UC1 here; `channel` picks another one for a single call without switching.
+const dThumb2 = await toDrive(thPath, "image/jpeg");
+let n = ytAuth.length;
+await Promise.all([call("list_my_videos", { channel: "UC1" }), call("list_my_videos", { channel: "Second Channel" }), call("get_video_stats", { channel: "UC2" }), call("get_video_stats", {})]);
+const used = new Set(ytAuth.slice(n));
+check("calls for different channels run at the same time, each with its own channel's token", used.size === 2 && used.has("fresh:r2") && used.has("fresh:new-yt-refresh"), [...used].join(" "));
+check("naming a channel does not change the active one", (await call("whoami")).channel_id === "UC1");
+n = ytAuth.length;
+const [upA, upB] = await Promise.all([
+  call("upload_video", { drive_file: dKeep.id, title: "To channel one", delete_from_drive: false, thumbnail_drive_file: dThumb2.id }),
+  call("upload_video", { drive_file: dKeep.id, title: "To channel two", delete_from_drive: false, thumbnail_drive_file: dThumb2.id, channel: "UC2" }),
+]);
+check("the same Drive video uploads to two channels at once", upA.status === "done" && upB.status === "done" && upA.video_id !== upB.video_id, JSON.stringify([upA.status, upB.status]));
+const jobB = (await sql`SELECT extras FROM jobs WHERE video_id = ${upB.video_id}`)[0];
+check("an upload remembers its channel, so its thumbnail goes to the same channel", jobB.extras.channel_id === "UC2" && upB.extras.some((x: string) => x.startsWith("thumbnail set")) &&
+  ytAuth.slice(n).filter((t) => t === "fresh:new-yt-refresh").length >= 2 && ytAuth.slice(n).filter((t) => t === "fresh:r2").length >= 2, ytAuth.slice(n).join(" "));
+const before = log.length;
+await call("list_comments", { channel: "second" });
+check("list_comments reads the named channel's comments", log.slice(before).some((l) => l.includes("allThreadsRelatedToChannelId=UC2")), log.slice(before).join(" | "));
+const unknown = await call("list_my_videos", { channel: "UCnope" }).then(() => "", (e: Error) => e.message);
+check("an unknown channel on any tool gives a clear error", /No linked channel/.test(unknown), unknown);
+
+// ------------------------------------------------------------------ 16. Demand vs supply (find_gaps)
+const gaps = await call("find_gaps", { topics: ["Busy Show", "Paid Show", "Open Show"] });
+const g = Object.fromEntries(gaps.topics.map((t: any) => [t.topic, t]));
+check("find_gaps ranks the open topic first and the crowded one below it", gaps.topics[0].topic === "Open Show" && g["Open Show"].gap_score > g["Busy Show"].gap_score, gaps.topics.map((t: any) => `${t.topic}:${t.gap_score}`).join(" "));
+check("trailer re-uploads and dubs are not counted as original videos", g["Open Show"].original_videos === 1 && g["Open Show"].reuploads === 1 && g["Open Show"].top_originals[0].title.startsWith("Why Open Show"), JSON.stringify(g["Open Show"]));
+check("the demand video is the most-viewed one, with its like rate", g["Open Show"].demand.views === 1000000 && g["Open Show"].demand.like_rate_percent === 2);
+check("many views with almost no likes is flagged as promotion and marked down", g["Paid Show"].suspect_promotion === true && g["Paid Show"].gap_score < g["Open Show"].gap_score, JSON.stringify(g["Paid Show"].demand));
+check("find_gaps reports 100 units per topic", gaps.quota_cost === 303, String(gaps.quota_cost));
+const fromChart = await call("find_gaps", { max_topics: 2 });
+check("without topics it takes them from the most-popular chart, cleaned of hashtags", fromChart.topics_from === "chart" && fromChart.topics.length === 2 && fromChart.topics.every((t: any) => !t.topic.includes("#")), JSON.stringify(fromChart.topics.map((t: any) => t.topic)));
+searchQuota = "exceeded";
+const partial = await call("find_gaps", { topics: ["Open Show"] });
+check("running out of quota stops cleanly with what it has", /quota ran out/.test(partial.stopped_early ?? "") && partial.topics.length === 0, JSON.stringify(partial));
+searchQuota = "ok";
 
 const failed = results.filter((r) => !r[1]);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);

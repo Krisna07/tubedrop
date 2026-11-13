@@ -148,7 +148,7 @@ export async function googleCallback(req: Request) {
 
   if (p.stage === "yt" || p.stage === "yt_add") {
     // Step 2: the YouTube channel (personal or brand account).
-    if (!granted.includes(YT_SCOPE)) return html("<h1>YouTube permission was not granted</h1><p>Press Connect again and tick the YouTube box.</p>", 400);
+    if (!granted.includes(YT_SCOPE)) return html("<h1>YouTube permission was not granted</h1><p>Go back to Claude, start again and tick the YouTube box.</p>", 400);
     const ch = await fetch("https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true", { headers: { authorization: `Bearer ${t.access_token}` } });
     const chJson = (await ch.json()) as { items?: { id: string; snippet: { title: string } }[] };
     const channel = chJson.items?.[0];
@@ -160,7 +160,7 @@ export async function googleCallback(req: Request) {
       : existing[0]?.yt_refresh_enc ?? (legacy[0]?.channel_id === channel.id ? legacy[0]?.yt_refresh_enc : null) ?? null;
     if (!ytRefresh) return html("<h1>Google did not return offline access</h1><p>Remove the app at myaccount.google.com/permissions and connect again.</p>", 400);
     await sql`INSERT INTO channels (user_id, channel_id, title, yt_refresh_enc) VALUES (${p.user_id}, ${channel.id}, ${channel.snippet.title}, ${ytRefresh})
-              ON CONFLICT (user_id, channel_id) DO UPDATE SET title = EXCLUDED.title, yt_refresh_enc = EXCLUDED.yt_refresh_enc`;
+              ON CONFLICT (user_id, channel_id) DO UPDATE SET title = EXCLUDED.title, yt_refresh_enc = EXCLUDED.yt_refresh_enc, yt_access_enc = NULL, yt_expiry = NULL`;
     if (p.stage === "yt_add") {
       return html(`<h1>Channel added</h1><p><b>${escapeHtml(channel.snippet.title)}</b> is linked. Go back to Claude and ask it to switch to that channel.</p>`);
     }
