@@ -9,7 +9,7 @@ export const ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.rea
 
 const ACCESS_TTL = 60 * 60;
 const REFRESH_TTL = 60 * 60 * 24 * 60;
-const ALLOWED_REDIRECT_HOSTS = ["claude.ai", "claude.com", "localhost", "127.0.0.1"];
+const ALLOWED_REDIRECT_HOSTS = ["claude.ai", "claude.com", "localhost", "127.0.0.1", "grok.com", "x.ai"];
 
 function configuredList(name: string): string[] {
   return (process.env[name] ?? "").split(",").map((value) => value.trim()).filter(Boolean);
