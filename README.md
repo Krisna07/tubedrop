@@ -50,7 +50,7 @@ Fork this repository (or use it as a template) into your own GitHub account.
 | `PUBLIC_URL` | optional | e.g. `https://my-uploader.vercel.app` if you use a custom domain |
 | `GITHUB_TOKEN`, `MEDIA_REPO` (owner/repo), `SKETCHFAB_TOKEN` | optional | Only for the GitHub-relay and Sketchfab tools |
 | `META_ACCESS_TOKEN` | optional | Only for Instagram Reels. The Instagram tools appear only when this is set. |
-| `DOWNFORGE_TOKEN`, `DOWNFORGE_URL` | optional | Only for `import_from_url`: the `ACCESS_TOKEN` of your DownForge/Youtube2drive deployment and its URL (default `https://youtube2drive.vercel.app`). It downloads a link straight into a Drive folder. |
+| `DOWNFORGE_TOKEN`, `DOWNFORGE_URL` | optional | Only for `import_from_url`: the `ACCESS_TOKEN` of your DownForge/Youtube2drive deployment (leave unset if it runs with `PUBLIC_ACCESS`) and its URL (default `https://youtube2drive.vercel.app`). It downloads a link straight into a Drive folder. |
 | `META_APP_ID`, `META_APP_SECRET` | optional | Lets `whoami` show when the Instagram token expires. |
 | `META_IG_USER_ID` | optional | Only if the token reaches several Instagram accounts and you want a specific one. |
 

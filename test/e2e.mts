@@ -297,11 +297,12 @@ async function fakeMeta(url: string, init: any = {}): Promise<Response> {
 
 // ------------------------------------------------------------------ fake DownForge (/api/save fills the caller's Drive session)
 const dfCalls: any[] = [];
-let dfMode: "done" | "slow" | "error" = "done";
+let dfMode: "done" | "slow" | "error" | "locked" = "done";
 const trailer = randomBytes(5 * 1024 * 1024 + 77);
 async function fakeDownforge(url: string, init: any): Promise<Response> {
   const j = JSON.parse(String(init.body));
-  dfCalls.push({ ...j, endpoint: url, auth: init.headers.authorization });
+  dfCalls.push({ ...j, endpoint: url, auth: init.headers?.authorization });
+  if (dfMode === "locked") return new Response(JSON.stringify({ error: "Missing or wrong access token." }), { status: 401 });
   if (dfMode === "error") return new Response(JSON.stringify({ error: "This video is unavailable.", code: "UNAVAILABLE" }), { status: 422 });
   const session = String(j.upload_url).replace("https://www.googleapis.com", `http://127.0.0.1:${PORT}`);
   const put = async (s: number, e: number) => realFetch(session, { method: "PUT", headers: { "content-range": `bytes ${s}-${e}/${trailer.length}` }, body: trailer.subarray(s, e + 1) });
@@ -635,8 +636,13 @@ searchQuota = "ok";
 // ------------------------------------------------------------------ 17. import_from_url (DownForge -> Drive) and get_drive_download
 {
 process.env.DOWNFORGE_URL = "https://downforge.test";
-const noToken = await call("import_from_url", { url: "https://www.youtube.com/watch?v=abc" }).then(() => "", (e: Error) => e.message);
-check("import_from_url says what is missing when DOWNFORGE_TOKEN is not set", /DOWNFORGE_TOKEN/.test(noToken), noToken);
+const open = await call("import_from_url", { url: "https://www.youtube.com/watch?v=open", file_name: "Open trailer" });
+check("without DOWNFORGE_TOKEN it calls a public downloader with no Authorization header", open.status === "done" && dfCalls[0]?.auth === undefined, JSON.stringify({ status: open.status, auth: dfCalls[0]?.auth }));
+dfMode = "locked";
+const locked = await call("import_from_url", { url: "https://www.youtube.com/watch?v=locked" }).then(() => "", (e: Error) => e.message);
+check("a downloader that wants a token gives a clear hint about DOWNFORGE_TOKEN", /DOWNFORGE_TOKEN/.test(locked), locked);
+dfMode = "done";
+dfCalls.length = 0;
 process.env.DOWNFORGE_TOKEN = "df-secret";
 const theirs: DFile = { id: "fold_user_made", name: "Dumbstuff Sources", mimeType: "application/vnd.google-apps.folder", parents: ["root"], data: Buffer.alloc(0), appProperties: { locked: "1" } };
 drive.set(theirs.id, theirs);

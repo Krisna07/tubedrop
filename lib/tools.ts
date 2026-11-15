@@ -744,8 +744,7 @@ async function finishUrlImport(jobId: string, file: Args, rename?: string) {
 }
 
 async function importFromUrl(userId: string, a: Args) {
-  const token = process.env.DOWNFORGE_TOKEN;
-  if (!token) throw new ToolError("import_from_url is not set up: add DOWNFORGE_TOKEN (the downloader's ACCESS_TOKEN) to this server's environment.");
+  const token = process.env.DOWNFORGE_TOKEN;            // optional: only needed when the downloader has ACCESS_TOKEN set
   const url = String(a.url ?? "").trim();
   if (!/^https?:\/\//i.test(url)) throw new ToolError("Give a full http(s) link.");
   const format = IMPORT_TYPES[a.format] ? a.format : "auto";
@@ -764,7 +763,7 @@ async function importFromUrl(userId: string, a: Args) {
   try {
     r = await fetch(`${DOWNFORGE_URL()}/api/save`, {
       method: "POST",
-      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), "content-type": "application/json" },
       body: JSON.stringify({ url, format, quality, upload_url: session, wait_seconds: SAVE_WAIT_S }),
       signal: AbortSignal.timeout((SAVE_WAIT_S + 30) * 1000),
     });
@@ -773,6 +772,10 @@ async function importFromUrl(userId: string, a: Args) {
   }
   const body = (await r.json().catch(() => ({}))) as Args;
   if (r.status === 202) return urlImportPending(jobId);
+  if (r.status === 401 || r.status === 503) {
+    await sql`UPDATE jobs SET status = 'failed', error = ${String(body.error ?? r.status).slice(0, 500)}, updated_at = now() WHERE id = ${jobId}`;
+    throw new ToolError(`The downloader refused the request (${r.status}): ${body.error ?? "access token needed"}. Set DOWNFORGE_TOKEN on this server to the downloader's ACCESS_TOKEN (or one of its EXTRA_ACCESS_TOKENS).`);
+  }
   if (!r.ok || !body.drive_file?.id) {
     const why = body.error ?? `HTTP ${r.status}`;
     await sql`UPDATE jobs SET status = 'failed', error = ${String(why).slice(0, 500)}, updated_at = now() WHERE id = ${jobId}`;
