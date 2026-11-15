@@ -41,6 +41,8 @@ async function handleRpc(msg: Rpc, userId: string, req: Request): Promise<object
           "to the returned URL, then upload_video with the Drive file id (and thumbnail/captions Drive ids); the Drive copies " +
           "are deleted once YouTube has them. Upload as private or scheduled by default, and only make a video public when " +
           "the user has clearly said so in this conversation. Large uploads take several continue_upload calls." +
+          " import_from_url downloads a web link (e.g. a YouTube trailer) straight into a Drive folder, and get_drive_download " +
+          "gives a sandbox a short-lived link to fetch a Drive file's bytes." +
           " If Instagram is set up, instagram_publish_reel posts a Drive video as a Reel; a Reel is public as soon as it is " +
           "published, so only post one when the user has clearly said to in this conversation.",
       });

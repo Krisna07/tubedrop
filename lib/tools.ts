@@ -81,6 +81,39 @@ export const TOOLS = [
     },
   },
   {
+    name: "import_from_url",
+    description:
+      "Download a video or audio track from a web link (YouTube, Vimeo, TikTok, a direct .mp4 link...) straight into a Google " +
+      "Drive folder, without passing through this chat. Uses the user's DownForge/Youtube2drive downloader, which saves into a Drive " +
+      "upload session this connector opens. `folder` is a Drive folder name or id (default: 'TubeDrop Uploads'); a folder name " +
+      "that does not exist yet is created. Returns drive_file_id when done; if status is 'in_progress', call continue_upload with " +
+      "the job_id until it says 'done'. To then work on the file in a sandbox, use get_drive_download.",
+    inputSchema: {
+      type: "object",
+      required: ["url"],
+      properties: {
+        url: { type: "string", description: "Media page or file URL, e.g. a YouTube watch link." },
+        folder: { type: "string", description: "Drive folder name (e.g. 'Dumbstuff Sources') or folder id/link. Default 'TubeDrop Uploads'." },
+        file_name: { type: "string", description: "Name for the Drive file, e.g. 'Toy Story 5 official trailer'. The extension is added. Default: the source's own title." },
+        format: { type: "string", enum: ["auto", "mp4", "mkv", "mp3", "m4a"], description: "auto (default, ends as a playable .mp4), mp4, mkv, or mp3/m4a for audio only." },
+        quality: { type: "string", enum: ["360", "480", "720", "1080", "1440", "2160", "best"], description: "Max video height. Default 1080." },
+      },
+    },
+  },
+  {
+    name: "get_drive_download",
+    description:
+      "Get a direct, short-lived download for a Drive file so a sandbox or script can fetch its bytes from www.googleapis.com " +
+      "(e.g. to edit a video imported with import_from_url). Returns the URL, an Authorization header valid for at least 20 " +
+      "minutes, and a ready curl command. The token only grants access to the user's Google Drive; never print it in a message, " +
+      "file or commit.",
+    inputSchema: {
+      type: "object",
+      required: ["drive_file"],
+      properties: { drive_file: { type: "string", description: "Google Drive file ID or share link." } },
+    },
+  },
+  {
     name: "upload_video",
     description:
       "Upload a video from Google Drive to the user's YouTube channel, with all metadata. Optionally sets the thumbnail, " +
@@ -131,7 +164,7 @@ export const TOOLS = [
   },
   {
     name: "continue_upload",
-    description: "Continue a large transfer started by upload_video or import_from_github. Call repeatedly until status is 'done'.",
+    description: "Continue a large transfer started by upload_video, import_from_github or import_from_url. Call repeatedly until status is 'done'.",
     inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" } } },
   },
   {
@@ -619,6 +652,173 @@ function importSummary(job: Args) {
   return { status: "done", drive_file_id: job.drive_id, name: job.meta?.name, size_mb: Math.round(Number(job.total) / 1048576 * 10) / 10 };
 }
 
+// ---------------------------------------------------------------- import from a web link (via the DownForge downloader)
+
+const DOWNFORGE_URL = () => (process.env.DOWNFORGE_URL || "https://youtube2drive.vercel.app").replace(/\/+$/, "");
+const SAVE_WAIT_S = Math.min(Math.max(Number(process.env.SAVE_WAIT_SECONDS ?? 240) || 240, 10), 255);
+const FOLDER_MIME = "application/vnd.google-apps.folder";
+const IMPORT_TYPES: Record<string, { ext: string; mime: string }> = {
+  auto: { ext: "mp4", mime: "video/mp4" }, mp4: { ext: "mp4", mime: "video/mp4" }, mkv: { ext: "mkv", mime: "video/x-matroska" },
+  mp3: { ext: "mp3", mime: "audio/mpeg" }, m4a: { ext: "m4a", mime: "audio/mp4" },
+};
+
+function cleanName(name: string, ext: string): string {
+  const base = name.replace(/[\\/:*?"<>|\x00-\x1f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 150) || "download";
+  return base.toLowerCase().endsWith("." + ext) ? base : `${base.replace(/\.(mp4|mkv|webm|mov|mp3|m4a)$/i, "")}.${ext}`;
+}
+
+const q = (v: string) => v.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+
+/** The Drive folder to import into: by id/link, else by name (our own folder of that name first), created if missing. */
+async function importFolder(dr: string, ref?: string): Promise<{ id: string; name: string; ours: boolean }> {
+  const want = String(ref ?? "").trim();
+  if (!want) return { id: await uploadsFolder(dr, UPLOADS_FOLDER_NAME), name: UPLOADS_FOLDER_NAME, ours: true };
+  if (/drive\.google\.com|^[A-Za-z0-9_-]{25,}$/.test(want)) {
+    const f = await gjson<{ id: string; name: string; mimeType: string; appProperties?: Args }>(dr,
+      `https://www.googleapis.com/drive/v3/files/${driveId(want)}?fields=id,name,mimeType,appProperties&supportsAllDrives=true`);
+    if (f.mimeType !== FOLDER_MIME) throw new ToolError(`${f.name} is not a folder.`);
+    return { id: f.id, name: f.name, ours: !!f.appProperties?.tubedrop_folder };
+  }
+  const found = await gjson<{ files: { id: string; appProperties?: Args }[] }>(dr, `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(
+    `mimeType = '${FOLDER_MIME}' and trashed = false and name = '${q(want)}'`)}&fields=files(id,appProperties)&orderBy=createdTime&pageSize=10`);
+  const ours = found.files?.find((f) => f.appProperties?.tubedrop_folder);
+  if (ours) return { id: ours.id, name: want, ours: true };
+  if (found.files?.[0]) return { id: found.files[0].id, name: want, ours: false };
+  return { id: await makeFolder(dr, want), name: want, ours: true };
+}
+
+async function makeFolder(dr: string, name: string): Promise<string> {
+  const made = await gjson<{ id: string }>(dr, "https://www.googleapis.com/drive/v3/files?fields=id", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name, mimeType: FOLDER_MIME, appProperties: { tubedrop_folder: "1" } }),
+  });
+  return made.id;
+}
+
+/** Opens a Drive resumable session of unknown length. Falls back to a folder of the same name this connector owns when Drive won't let it write into the user's one. */
+async function openImportSession(dr: string, name: string, mime: string, folder: { id: string; name: string; ours: boolean }) {
+  const open = (parent: string) => gfetch(dr, "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id,name,mimeType,size&supportsAllDrives=true", {
+    method: "POST",
+    headers: { "content-type": "application/json; charset=UTF-8", "x-upload-content-type": mime },
+    body: JSON.stringify({ name, parents: [parent], mimeType: mime }),
+  });
+  let r = await open(folder.id);
+  let note: string | undefined;
+  if ((r.status === 403 || r.status === 404) && !folder.ours) {
+    folder = { id: await makeFolder(dr, folder.name), name: folder.name, ours: true };
+    note = `Drive did not let this connector write into the existing "${folder.name}" folder, so it made its own folder with that name and saved there; later imports use it too.`;
+    r = await open(folder.id);
+  }
+  if (!r.ok) throw new ToolError(`Drive refused the upload (${r.status}): ${(await r.text()).slice(0, 300)}`);
+  const session = r.headers.get("location");
+  if (!session) throw new ToolError("Drive did not return an upload session.");
+  return { session, folder, note };
+}
+
+function urlImportSummary(job: Args) {
+  const m = job.meta ?? {};
+  return { status: "done", drive_file_id: job.drive_id, name: m.name, size_mb: Math.round(Number(job.total) / 1048576 * 10) / 10,
+    folder: m.folder_name, folder_id: m.folder_id, ...(m.note ? { note: m.note } : {}), next: "To fetch it into a sandbox, call get_drive_download." };
+}
+
+function urlImportPending(jobId: string) {
+  return { status: "in_progress", job_id: jobId, note: "The downloader is still fetching the media into Drive.", next: `Wait about a minute, then call continue_upload with job_id "${jobId}".` };
+}
+
+async function finishUrlImport(jobId: string, file: Args, rename?: string) {
+  const sql = await db();
+  const job = (await sql`SELECT * FROM jobs WHERE id = ${jobId}`)[0];
+  const meta = { ...(job.meta ?? {}) } as Args;
+  if (rename && rename !== file.name) {
+    try {
+      const dr = await accessToken(job.user_id, "drive");
+      const r = await gjson<Args>(dr, `https://www.googleapis.com/drive/v3/files/${file.id}?fields=id,name&supportsAllDrives=true`, {
+        method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: rename }),
+      });
+      meta.name = r.name;
+    } catch { meta.name = file.name; }
+  } else meta.name = file.name ?? meta.name;
+  const total = Number(file.size ?? job.total ?? 0);
+  await sql`UPDATE jobs SET status = 'done', drive_id = ${file.id}, total = ${total}, uploaded = ${total}, meta = ${JSON.stringify(meta)}, updated_at = now() WHERE id = ${jobId}`;
+  return urlImportSummary({ ...job, drive_id: file.id, total, meta });
+}
+
+async function importFromUrl(userId: string, a: Args) {
+  const token = process.env.DOWNFORGE_TOKEN;
+  if (!token) throw new ToolError("import_from_url is not set up: add DOWNFORGE_TOKEN (the downloader's ACCESS_TOKEN) to this server's environment.");
+  const url = String(a.url ?? "").trim();
+  if (!/^https?:\/\//i.test(url)) throw new ToolError("Give a full http(s) link.");
+  const format = IMPORT_TYPES[a.format] ? a.format : "auto";
+  const quality = ["360", "480", "720", "1080", "1440", "2160", "best"].includes(String(a.quality)) ? String(a.quality) : "1080";
+  const { ext, mime } = IMPORT_TYPES[format];
+  const sql = await db();
+  const dr = await accessToken(userId, "drive");
+  const named = !!String(a.file_name ?? "").trim();
+  const name = named ? cleanName(a.file_name, ext) : `download-${new Date().toISOString().replace(/[:.]/g, "-")}.${ext}`;
+  const { session, folder, note } = await openImportSession(dr, name, mime, await importFolder(dr, a.folder));
+  const jobId = "url_" + randomId(9);
+  await sql`INSERT INTO jobs (id, user_id, drive_id, session_uri_enc, total, uploaded, mime, meta, extras, status, kind)
+            VALUES (${jobId}, ${userId}, '', ${encrypt(session)}, 0, 0, ${mime},
+                    ${JSON.stringify({ name, url, format, quality, folder_id: folder.id, folder_name: folder.name, note })}, '{}', 'uploading', 'urlimport')`;
+  let r: Response;
+  try {
+    r = await fetch(`${DOWNFORGE_URL()}/api/save`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ url, format, quality, upload_url: session, wait_seconds: SAVE_WAIT_S }),
+      signal: AbortSignal.timeout((SAVE_WAIT_S + 30) * 1000),
+    });
+  } catch {
+    return urlImportPending(jobId);                      // the downloader keeps going in the background
+  }
+  const body = (await r.json().catch(() => ({}))) as Args;
+  if (r.status === 202) return urlImportPending(jobId);
+  if (!r.ok || !body.drive_file?.id) {
+    const why = body.error ?? `HTTP ${r.status}`;
+    await sql`UPDATE jobs SET status = 'failed', error = ${String(why).slice(0, 500)}, updated_at = now() WHERE id = ${jobId}`;
+    throw new ToolError(`The downloader could not save that link (${r.status}): ${why}`);
+  }
+  const rename = !named && body.source_name ? cleanName(body.source_name, ext) : undefined;
+  return finishUrlImport(jobId, { ...body.drive_file, size: body.drive_file.size ?? body.bytes }, rename);
+}
+
+/** continue_upload for a url import: ask Drive whether the downloader has finished filling the session. */
+async function urlImportStatus(job: Args) {
+  const sql = await db();
+  if (job.status === "done") return urlImportSummary(job);
+  if (job.status === "failed") throw new ToolError(`That import failed: ${job.error}`);
+  const probe = await fetch(decrypt(job.session_uri_enc), { method: "PUT", headers: { "content-range": "bytes */*", "content-length": "0" } });
+  if (probe.status === 200 || probe.status === 201) return finishUrlImport(job.id, await probe.json());
+  const ageMin = (Date.now() - new Date(job.updated_at).getTime()) / 60000;
+  if (probe.status === 308) {
+    const range = probe.headers.get("range");
+    const got = range ? Number(range.split("-")[1]) + 1 : 0;
+    if (got > Number(job.uploaded)) await sql`UPDATE jobs SET uploaded = ${got}, updated_at = now() WHERE id = ${job.id}`;
+    else if (ageMin > 12) {
+      await sql`UPDATE jobs SET status = 'failed', error = 'stalled', updated_at = now() WHERE id = ${job.id}`;
+      throw new ToolError("The import stalled: nothing reached Drive for over 12 minutes. Start it again, perhaps at a lower quality.");
+    }
+    return { ...urlImportPending(job.id), received_mb: Math.round(got / 1048576) };
+  }
+  await sql`UPDATE jobs SET status = 'failed', error = ${`session ${probe.status}`}, updated_at = now() WHERE id = ${job.id}`;
+  throw new ToolError("The download failed and the downloader cancelled the Drive upload. Try again, or pick a lower quality.");
+}
+
+async function driveDownload(userId: string, a: Args) {
+  const dr = await accessToken(userId, "drive", null, 20 * 60 * 1000);
+  const f = await driveMeta(dr, driveId(String(a.drive_file ?? "")));
+  if (f.mimeType.startsWith("application/vnd.google-apps")) throw new ToolError(`${f.name} is a Google ${f.mimeType.split(".").pop()} file, not a file with bytes to download.`);
+  const url = `https://www.googleapis.com/drive/v3/files/${f.id}?alt=media&supportsAllDrives=true`;
+  const out = f.name.replace(/[^\w.\- ]+/g, "_");
+  return {
+    name: f.name, mime: f.mimeType, size_bytes: Number(f.size ?? 0), url,
+    headers: { authorization: `Bearer ${dr}` },
+    valid_for: "at least 20 minutes",
+    curl: `curl -fL --retry 3 -H 'Authorization: Bearer ${dr}' -o '${out}' '${url}'`,
+    note: "The token grants access to the user's Google Drive only. Use it for this download and never print it in a message, file or commit.",
+  };
+}
+
 // ---------------------------------------------------------------- the upload pump
 
 async function pump(userId: string, jobId: string) {
@@ -628,6 +828,7 @@ async function pump(userId: string, jobId: string) {
   let job = (await sql`SELECT * FROM jobs WHERE id = ${jobId} AND user_id = ${userId}`)[0];
   if (!job) throw new ToolError(`No upload job ${jobId}.`);
   if (job.kind === "ig") throw new ToolError(`${jobId} is an Instagram Reel; use instagram_continue_publish.`);
+  if (job.kind === "urlimport") return urlImportStatus(job);
   const isImport = job.kind === "import";
   if (job.status === "done") return isImport ? importSummary(job) : summary(job);
   if (job.status === "failed") throw new ToolError(`That upload failed earlier: ${job.error}`);
@@ -1216,6 +1417,10 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
     }
     case "import_from_github":
       return startImport(userId, a);
+    case "import_from_url":
+      return importFromUrl(userId, a);
+    case "get_drive_download":
+      return driveDownload(userId, a);
     case "get_upload_url":
       return getUploadUrl(userId, a, chan);
     case "continue_upload":

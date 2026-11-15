@@ -20,14 +20,14 @@ async function refreshGoogle(refreshEnc: string): Promise<{ token: string; enc: 
   return { token: t.access_token, enc: encrypt(t.access_token), exp: new Date(Date.now() + (t.expires_in ?? 3600) * 1000 - 60000).toISOString() };
 }
 
-const live = (accessEnc: unknown, expiry: unknown) => !!accessEnc && !!expiry && new Date(expiry as string) > new Date();
+const live = (accessEnc: unknown, expiry: unknown, minValidMs = 0) => !!accessEnc && !!expiry && new Date(expiry as string).getTime() > Date.now() + minValidMs;
 
 /**
  * kind "drive" = the personal Google account; kind "yt" = a linked YouTube channel.
  * channelId picks which linked channel; without it the active one (users.channel_id) is used.
  * Each channel caches its own access token, so calls for different channels never share one.
  */
-export async function accessToken(userId: string, kind: "yt" | "drive" = "yt", channelId?: string | null): Promise<string> {
+export async function accessToken(userId: string, kind: "yt" | "drive" = "yt", channelId?: string | null, minValidMs = 0): Promise<string> {
   const sql = await db();
   const rows = await sql`SELECT * FROM users WHERE id = ${userId}`;
   const u = rows[0];
@@ -46,7 +46,7 @@ export async function accessToken(userId: string, kind: "yt" | "drive" = "yt", c
   // Drive, or an account linked before channels had their own rows.
   const useYt = kind === "yt" && !!u.yt_refresh_enc;
   const refreshEnc = useYt ? u.yt_refresh_enc : u.google_refresh_enc;
-  if (live(useYt ? u.yt_access_enc : u.google_access_enc, useYt ? u.yt_expiry : u.google_expiry)) return decrypt(useYt ? u.yt_access_enc : u.google_access_enc);
+  if (live(useYt ? u.yt_access_enc : u.google_access_enc, useYt ? u.yt_expiry : u.google_expiry, minValidMs)) return decrypt(useYt ? u.yt_access_enc : u.google_access_enc);
   const f = await refreshGoogle(refreshEnc);
   // Only cache against the refresh token that produced it, so a concurrent change cannot be given the wrong token.
   if (useYt) await sql`UPDATE users SET yt_access_enc = ${f.enc}, yt_expiry = ${f.exp}, updated_at = now() WHERE id = ${userId} AND yt_refresh_enc = ${refreshEnc}`;

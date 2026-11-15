@@ -39,7 +39,7 @@ const pg = new PGlite();
 
 // ------------------------------------------------------------------ fake Google
 type DFile = { id: string; name: string; mimeType: string; parents: string[]; data: Buffer; appProperties?: Record<string, string> };
-type Session = { kind: string; meta: any; total: number; got: Buffer[]; received: number; done?: any; url: string };
+type Session = { kind: string; meta: any; total: number; got: Buffer[]; received: number; done?: any; url: string; cancelled?: boolean };
 const drive = new Map<string, DFile>();
 const videos = new Map<string, { id: string; snippet: any; status: any; data: Buffer }>();
 const thumbs = new Map<string, Buffer>();
@@ -121,12 +121,15 @@ const server = http.createServer(async (req, res) => {
     if (!s) return send(res, 404, { error: "no session" });
     if (s.done) return send(res, 200, s.done);
     const cr = String(req.headers["content-range"] ?? "");
-    const probe = /^bytes \*\/(\d+)$/.exec(cr);
+    if (s.cancelled) return send(res, 404, { error: "session cancelled" });
+    if (req.method === "DELETE") { s.cancelled = true; return send(res, 499, {}); }
+    const probe = /^bytes \*\/(\d+|\*)$/.exec(cr);
     const rangeHdr = (): Record<string, string> => (s.received ? { range: `bytes=0-${s.received - 1}` } : {});
     if (probe) return send(res, 308, undefined, rangeHdr());
     if (failNextSessionPut > 0) { failNextSessionPut--; return send(res, 503, { error: "backend error (injected)" }); }
     const m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(cr);
     const start = m ? Number(m[1]) : 0;
+    if (m) s.total = Number(m[3]);                              // sessions opened without a length learn it from the chunks
     if (start !== s.received) return send(res, 308, undefined, rangeHdr());   // out of order: tell the client where we are
     s.got.push(b); s.received += b.length;
     if (s.received >= s.total) { s.done = complete(s); return send(res, 200, s.done); }
@@ -138,6 +141,8 @@ const server = http.createServer(async (req, res) => {
   // ---- uploads
   if (p === "/upload/drive/v3/files" && u.searchParams.get("uploadType") === "resumable") {
     const meta = JSON.parse(b.toString());
+    // drive.file scope: the connector may not write into a folder some other app made
+    if ((meta.parents ?? []).some((pid: string) => drive.get(pid)?.appProperties?.locked)) return send(res, 404, { error: { message: "File not found: parent" } });
     return send(res, 200, {}, { location: newSession("drive", { ...meta, mimeType: req.headers["x-upload-content-type"] }, Number(req.headers["x-upload-content-length"])) });
   }
   if (p === "/upload/youtube/v3/videos") {
@@ -164,7 +169,9 @@ const server = http.createServer(async (req, res) => {
     const q = u.searchParams.get("q") ?? "";
     let files = [...drive.values()];
     if (q.includes("appProperties has")) files = files.filter((f) => f.appProperties?.tubedrop === "uploads" || (q.includes("dubiousArchive") && f.appProperties?.dubiousArchive === "uploads"));
-    return send(res, 200, { files: files.map((f) => ({ id: f.id, name: f.name, mimeType: f.mimeType })) });
+    const byName = /name = '((?:[^'\\]|\\.)*)'/.exec(q);
+    if (byName) files = files.filter((f) => f.name === byName[1].replace(/\\(.)/g, "$1") && (!q.includes("folder") || f.mimeType.endsWith("folder")));
+    return send(res, 200, { files: files.map((f) => ({ id: f.id, name: f.name, mimeType: f.mimeType, appProperties: f.appProperties })) });
   }
   if (p === "/drive/v3/files" && req.method === "POST") {
     const meta = JSON.parse(b.toString());
@@ -176,12 +183,13 @@ const server = http.createServer(async (req, res) => {
     const f = drive.get(dm[1]);
     if (!f) return send(res, 404, { error: { message: "File not found" } });
     if (req.method === "DELETE") { drive.delete(f.id); return send(res, 204); }
+    if (req.method === "PATCH") { Object.assign(f, { name: JSON.parse(b.toString()).name ?? f.name }); return send(res, 200, { id: f.id, name: f.name }); }
     if (u.searchParams.get("alt") === "media") {
       const r = /bytes=(\d+)-(\d+)/.exec(String(req.headers.range ?? ""));
       const chunk = r ? f.data.subarray(Number(r[1]), Number(r[2]) + 1) : f.data;
       res.writeHead(r ? 206 : 200, { "content-type": f.mimeType }); return res.end(chunk);
     }
-    return send(res, 200, { id: f.id, name: f.name, mimeType: f.mimeType, size: String(f.data.length), parents: f.parents });
+    return send(res, 200, { id: f.id, name: f.name, mimeType: f.mimeType, size: String(f.data.length), parents: f.parents, appProperties: f.appProperties });
   }
   // ---- YouTube data API
   if (p === "/youtube/v3/search" && req.method === "GET") {
@@ -287,11 +295,32 @@ async function fakeMeta(url: string, init: any = {}): Promise<Response> {
   return igReply({ error: { message: `fake meta: no route ${method} ${p}` } }, 404);
 }
 
+// ------------------------------------------------------------------ fake DownForge (/api/save fills the caller's Drive session)
+const dfCalls: any[] = [];
+let dfMode: "done" | "slow" | "error" = "done";
+const trailer = randomBytes(5 * 1024 * 1024 + 77);
+async function fakeDownforge(url: string, init: any): Promise<Response> {
+  const j = JSON.parse(String(init.body));
+  dfCalls.push({ ...j, endpoint: url, auth: init.headers.authorization });
+  if (dfMode === "error") return new Response(JSON.stringify({ error: "This video is unavailable.", code: "UNAVAILABLE" }), { status: 422 });
+  const session = String(j.upload_url).replace("https://www.googleapis.com", `http://127.0.0.1:${PORT}`);
+  const put = async (s: number, e: number) => realFetch(session, { method: "PUT", headers: { "content-range": `bytes ${s}-${e}/${trailer.length}` }, body: trailer.subarray(s, e + 1) });
+  if (dfMode === "slow") {                                  // half now, the rest "in the background" later
+    await put(0, 4 * 1024 * 1024 - 1);
+    dfLater = () => put(4 * 1024 * 1024, trailer.length - 1);
+    return new Response(JSON.stringify({ status: "in_progress" }), { status: 202 });
+  }
+  const r = await put(0, trailer.length - 1);
+  return new Response(JSON.stringify({ status: "done", drive_file: await r.json(), source_name: "Big Film - Official Trailer.mp4", mime: "video/mp4", bytes: trailer.length }), { status: 200 });
+}
+let dfLater: (() => Promise<unknown>) | null = null;
+
 // Route the server's Google and Meta calls to the fakes.
 const realFetch = globalThis.fetch;
 globalThis.fetch = (input: any, init?: any) => {
   let url = typeof input === "string" ? input : input.url;
   if (url.startsWith("https://graph.facebook.com/")) return fakeMeta(url, init);
+  if (url.startsWith("https://downforge.test/")) return fakeDownforge(url, init);
   url = url.replace("https://www.googleapis.com", `http://127.0.0.1:${PORT}`);
   url = url.replace("https://youtubeanalytics.googleapis.com", `http://127.0.0.1:${PORT}/yta`);
   if (url.startsWith("https://oauth2.googleapis.com") && String(init?.body).includes("authorization_code"))
@@ -602,6 +631,49 @@ searchQuota = "exceeded";
 const partial = await call("find_gaps", { topics: ["Open Show"] });
 check("running out of quota stops cleanly with what it has", /quota ran out/.test(partial.stopped_early ?? "") && partial.topics.length === 0, JSON.stringify(partial));
 searchQuota = "ok";
+
+// ------------------------------------------------------------------ 17. import_from_url (DownForge -> Drive) and get_drive_download
+{
+process.env.DOWNFORGE_URL = "https://downforge.test";
+const noToken = await call("import_from_url", { url: "https://www.youtube.com/watch?v=abc" }).then(() => "", (e: Error) => e.message);
+check("import_from_url says what is missing when DOWNFORGE_TOKEN is not set", /DOWNFORGE_TOKEN/.test(noToken), noToken);
+process.env.DOWNFORGE_TOKEN = "df-secret";
+const theirs: DFile = { id: "fold_user_made", name: "Dumbstuff Sources", mimeType: "application/vnd.google-apps.folder", parents: ["root"], data: Buffer.alloc(0), appProperties: { locked: "1" } };
+drive.set(theirs.id, theirs);
+const imp = await call("import_from_url", { url: "https://www.youtube.com/watch?v=abc", folder: "Dumbstuff Sources", quality: "720" });
+const impFile = drive.get(imp.drive_file_id);
+check("import_from_url sends the link, quality and a Drive session to the downloader with its token",
+  dfCalls[0]?.auth === "Bearer df-secret" && dfCalls[0].endpoint === "https://downforge.test/api/save" && dfCalls[0].url === "https://www.youtube.com/watch?v=abc" && dfCalls[0].quality === "720" && dfCalls[0].format === "auto" && /\/session\//.test(dfCalls[0].upload_url ?? ""), JSON.stringify(dfCalls[0] ?? {}).slice(0, 200));
+check("the downloaded file lands in Drive byte for byte, named after the source", imp.status === "done" && !!impFile && sha(impFile.data) === sha(trailer) && impFile.name === "Big Film - Official Trailer.mp4", JSON.stringify(imp));
+const ownFolder = impFile ? drive.get(impFile.parents[0]) : undefined;
+check("when Drive won't let it write into the user's folder, it saves into its own folder of the same name and says so",
+  ownFolder?.name === "Dumbstuff Sources" && ownFolder.id !== theirs.id && !!ownFolder.appProperties?.tubedrop_folder && /made its own folder/.test(imp.note ?? ""), JSON.stringify({ parent: impFile?.parents, note: imp.note }));
+const imp2 = await call("import_from_url", { url: "https://www.youtube.com/watch?v=def", folder: "Dumbstuff Sources", file_name: "Second Film trailer" });
+check("later imports reuse that folder and take the given file name", drive.get(imp2.drive_file_id)?.parents[0] === ownFolder?.id && imp2.name === "Second Film trailer.mp4" && !imp2.note, JSON.stringify(imp2));
+dfMode = "slow";
+const slow = await call("import_from_url", { url: "https://www.youtube.com/watch?v=slow", file_name: "Slow trailer" });
+const mid = await call("continue_upload", { job_id: slow.job_id });
+await dfLater!();
+const end = await call("continue_upload", { job_id: slow.job_id });
+check("a slow download comes back in_progress and continue_upload picks up the finished file",
+  slow.status === "in_progress" && mid.status === "in_progress" && mid.received_mb === 4 && end.status === "done" && sha(drive.get(end.drive_file_id)!.data) === sha(trailer) && end.folder === "TubeDrop Uploads", JSON.stringify([slow.status, mid, end.status]));
+dfMode = "error";
+const bad = await call("import_from_url", { url: "https://www.youtube.com/watch?v=gone" }).then(() => "", (e: Error) => e.message);
+check("a link the downloader can't fetch gives its reason", /unavailable/i.test(bad), bad);
+dfMode = "slow";
+const dead = await call("import_from_url", { url: "https://www.youtube.com/watch?v=dies" });
+const sess = [...sessions.values()].at(-1)!;
+sess.cancelled = true;                                      // what the downloader does when the download fails after replying
+const deadMsg = await call("continue_upload", { job_id: dead.job_id }).then(() => "", (e: Error) => e.message);
+check("a download that fails in the background is reported by continue_upload", /download failed/.test(deadMsg), deadMsg);
+dfMode = "done";
+await sql`UPDATE users SET google_expiry = ${new Date(Date.now() + 5 * 60e3).toISOString()} WHERE id = 'u1'`;
+const dl = await call("get_drive_download", { drive_file: imp.drive_file_id });
+const fetched = await realFetch(dl.url.replace("https://www.googleapis.com", `http://127.0.0.1:${PORT}`), { headers: dl.headers });
+const got = Buffer.from(await fetched.arrayBuffer());
+check("get_drive_download returns a working googleapis link and curl command", dl.url.startsWith("https://www.googleapis.com/drive/v3/files/") && sha(got) === sha(trailer) && dl.curl.includes(dl.url) && dl.size_bytes === trailer.length, `${fetched.status} ${dl.size_bytes}`);
+check("its token is refreshed when the cached one would expire within 20 minutes", dl.headers.authorization === "Bearer fresh:r1", dl.headers.authorization.slice(0, 20));
+}
 
 const failed = results.filter((r) => !r[1]);
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
