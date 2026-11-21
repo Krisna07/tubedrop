@@ -2,6 +2,7 @@ import { accessToken, driveBytes, driveId, driveMeta, driveSearch, gfetch, gjson
 import { continuePublish, instagramEnabled, listMedia, publishingLimit, publishReel, whoamiInstagram } from "./instagram.js";
 import { baseUrl, db, decrypt, encrypt, env, randomId } from "./util.js";
 import { ANALYTICS_SCOPE, googleUrl, YT_SCOPE } from "./oauth.js";
+import { MAX_TEXT, synthesize } from "./chatterbox.js";
 
 const YT = "https://www.googleapis.com/youtube/v3";
 const UPLOADS_FOLDER_NAME = "TubeDrop Uploads";
@@ -184,6 +185,27 @@ export const TOOLS = [
       type: "object",
       required: ["video_id", "drive_file"],
       properties: { video_id: { type: "string" }, drive_file: { type: "string" }, language: { type: "string" }, name: { type: "string" }, delete_from_drive: { type: "boolean", description: "Delete the captions file from Drive afterwards (only if it is in the connector's uploads folder). Default true." } },
+    },
+  },
+  {
+    name: "chatterbox_voiceover",
+    description:
+      "Generate a natural-sounding narration with Chatterbox Turbo (Resemble AI, run on a Hugging Face Space) and save it as a WAV " +
+      "in a Google Drive folder (default 'Chatterbox Voiceovers'). Clone a narrator by passing voice_drive_file, a clean 5-15 second " +
+      "clip of the voice in Drive. Paralinguistic tags in the text work: [chuckle], [laugh], [sigh], [gasp], [cough]. Long scripts " +
+      "are split at sentence ends and joined; the result lists when each piece starts, for captions. Returns drive_file_id; fetch it " +
+      "into a sandbox with get_drive_download. The Space is a shared free GPU: if this errors as busy or out of quota, use Kokoro.",
+    inputSchema: {
+      type: "object",
+      required: ["text"],
+      properties: {
+        text: { type: "string", description: `The script to read, up to ${MAX_TEXT} characters. For longer narration, call once per section.` },
+        voice_drive_file: { type: "string", description: "Drive file id or link of a 5-15 second reference clip (wav/mp3/m4a) to clone. Default: the Space's built-in voice." },
+        file_name: { type: "string", description: "Name for the Drive file; .wav is added. Default voiceover-<time>." },
+        folder: { type: "string", description: "Drive folder name or id. Default 'Chatterbox Voiceovers'." },
+        temperature: { type: "number", description: "0.05-2. Higher is more expressive and less stable. Default 0.8." },
+        seed: { type: "number", description: "Random seed, kept the same across pieces. Default 42." },
+      },
     },
   },
   {
@@ -822,6 +844,33 @@ async function driveDownload(userId: string, a: Args) {
   };
 }
 
+async function chatterboxVoiceover(userId: string, a: Args) {
+  const started = Date.now();
+  const text = String(a.text ?? "").trim();
+  if (!text) throw new ToolError("text is empty.");
+  if (text.length > MAX_TEXT) throw new ToolError(`text is ${text.length} characters; send at most ${MAX_TEXT} per call (split the script into sections).`);
+  const dr = await accessToken(userId, "drive");
+  let reference: { bytes: ArrayBuffer; name: string; mime: string } | undefined;
+  if (a.voice_drive_file) {
+    const f = await driveMeta(dr, driveId(String(a.voice_drive_file)));
+    if (!f.mimeType.startsWith("audio/") && !f.mimeType.startsWith("video/")) throw new ToolError(`${f.name} is ${f.mimeType}, not an audio clip.`);
+    if (Number(f.size ?? 0) > 20 * 1024 * 1024) throw new ToolError(`${f.name} is over 20 MB; use a 5-15 second clip.`);
+    reference = { bytes: await driveBytes(dr, f.id), name: f.name, mime: f.mimeType };
+  }
+  const temperature = a.temperature === undefined ? undefined : Math.min(2, Math.max(0.05, Number(a.temperature)));
+  const v = await synthesize(text, { reference, temperature, seed: a.seed === undefined ? undefined : Math.trunc(Number(a.seed)) }, started + BUDGET_MS - 20_000);
+  const name = cleanName(String(a.file_name ?? "").trim() || `voiceover-${new Date().toISOString().replace(/[:.]/g, "-")}`, "wav");
+  const { session, folder, note } = await openImportSession(dr, name, "audio/wav", await importFolder(dr, a.folder ?? "Chatterbox Voiceovers"));
+  const put = await fetch(session, { method: "PUT", headers: { "content-type": "audio/wav", "content-range": `bytes 0-${v.wav.length - 1}/${v.wav.length}` }, body: new Blob([v.wav as Uint8Array<ArrayBuffer>]) });
+  if (!put.ok) throw new ToolError(`Drive refused the voiceover (${put.status}): ${(await put.text()).slice(0, 200)}`);
+  const file = (await put.json()) as Args;
+  return {
+    status: "done", drive_file_id: file.id, name: file.name ?? name, folder: folder.name, folder_id: folder.id,
+    seconds: Math.round(v.seconds * 100) / 100, pieces: v.pieces, ...(note ? { note } : {}),
+    next: "Fetch it into a sandbox with get_drive_download.",
+  };
+}
+
 // ---------------------------------------------------------------- the upload pump
 
 async function pump(userId: string, jobId: string) {
@@ -1424,6 +1473,8 @@ export async function callTool(userId: string, name: string, a: Args, req: Reque
       return importFromUrl(userId, a);
     case "get_drive_download":
       return driveDownload(userId, a);
+    case "chatterbox_voiceover":
+      return chatterboxVoiceover(userId, a);
     case "get_upload_url":
       return getUploadUrl(userId, a, chan);
     case "continue_upload":

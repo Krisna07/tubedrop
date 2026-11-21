@@ -316,12 +316,42 @@ async function fakeDownforge(url: string, init: any): Promise<Response> {
 }
 let dfLater: (() => Promise<unknown>) | null = null;
 
+// Fake Chatterbox Space (Gradio REST API). Each piece comes back as 16-bit mono WAV, 10 ms per character, filled with its piece number.
+process.env.CHATTERBOX_SPACE = "https://chatterbox.test";
+const cbCalls: any[] = [];
+const cbUploads: number[] = [];
+let cbMode: "ok" | "quota" = "ok";
+function fakeWav(samples: number, value: number): Buffer {
+  const data = Buffer.alloc(samples * 2);
+  for (let i = 0; i < samples; i++) data.writeInt16LE(value, i * 2);
+  const h = Buffer.alloc(44);
+  h.write("RIFF", 0); h.writeUInt32LE(36 + data.length, 4); h.write("WAVE", 8); h.write("fmt ", 12); h.writeUInt32LE(16, 16);
+  h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22); h.writeUInt32LE(24000, 24); h.writeUInt32LE(48000, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34);
+  h.write("data", 36); h.writeUInt32LE(data.length, 40);
+  return Buffer.concat([h, data]);
+}
+async function fakeChatterbox(url: string, init: any): Promise<Response> {
+  const p = new URL(url).pathname;
+  if (p === "/gradio_api/info") return new Response(JSON.stringify({ named_endpoints: { "/generate": { parameters: [{ parameter_name: "text" }, { parameter_name: "audio_prompt_path", parameter_default: { path: "/tmp/default.wav", meta: { _type: "gradio.FileData" } } }] } } }));
+  if (p === "/gradio_api/upload") { const f = (init.body as FormData).get("files") as Blob; cbUploads.push(f.size); return new Response(JSON.stringify(["/tmp/gradio/ref/clip.wav"])); }
+  if (p === "/gradio_api/call/generate" && init?.method === "POST") { cbCalls.push(JSON.parse(String(init.body)).data); return new Response(JSON.stringify({ event_id: `e${cbCalls.length}` })); }
+  const ev = /^\/gradio_api\/call\/generate\/e(\d+)$/.exec(p);
+  if (ev) {
+    if (cbMode === "quota") return new Response(`event: error\ndata: "You have exceeded your free GPU quota"\n\n`);
+    return new Response(`event: generating\ndata: null\n\nevent: complete\ndata: [{"path":"/tmp/e${ev[1]}.wav","url":"https://chatterbox.test/gradio_api/file=/tmp/e${ev[1]}.wav"}]\n\n`);
+  }
+  const file = /file=\/tmp\/e(\d+)\.wav$/.exec(url);
+  if (file) { const n = Number(file[1]); return new Response(fakeWav(cbCalls[n - 1][0].length * 240, n)); }
+  return new Response("not found", { status: 404 });
+}
+
 // Route the server's Google and Meta calls to the fakes.
 const realFetch = globalThis.fetch;
 globalThis.fetch = (input: any, init?: any) => {
   let url = typeof input === "string" ? input : input.url;
   if (url.startsWith("https://graph.facebook.com/")) return fakeMeta(url, init);
   if (url.startsWith("https://downforge.test/")) return fakeDownforge(url, init);
+  if (url.startsWith("https://chatterbox.test/")) return fakeChatterbox(url, init);
   url = url.replace("https://www.googleapis.com", `http://127.0.0.1:${PORT}`);
   url = url.replace("https://youtubeanalytics.googleapis.com", `http://127.0.0.1:${PORT}/yta`);
   if (url.startsWith("https://oauth2.googleapis.com") && String(init?.body).includes("authorization_code"))
@@ -679,6 +709,40 @@ const fetched = await realFetch(dl.url.replace("https://www.googleapis.com", `ht
 const got = Buffer.from(await fetched.arrayBuffer());
 check("get_drive_download returns a working googleapis link and curl command", dl.url.startsWith("https://www.googleapis.com/drive/v3/files/") && sha(got) === sha(trailer) && dl.curl.includes(dl.url) && dl.size_bytes === trailer.length, `${fetched.status} ${dl.size_bytes}`);
 check("its token is refreshed when the cached one would expire within 20 minutes", dl.headers.authorization === "Bearer fresh:r1", dl.headers.authorization.slice(0, 20));
+}
+
+// ------------------------------------------------------------------ chatterbox_voiceover
+{
+  const short = await call("chatterbox_voiceover", { text: "If you're in a zombie apocalypse... [chuckle] this stump will save you.", file_name: "hook" });
+  const f = drive.get(short.drive_file_id);
+  check("chatterbox_voiceover saves a WAV into the Chatterbox Voiceovers folder", short.status === "done" && f?.name === "hook.wav" && f.mimeType === "audio/wav" && drive.get(f.parents[0])?.name === "Chatterbox Voiceovers" && f.data.subarray(0, 4).toString() === "RIFF", JSON.stringify(short));
+  check("without a reference it uses the Space's default voice and seed 42", cbCalls[0][1]?.path === "/tmp/default.wav" && cbCalls[0][3] === 42 && cbCalls[0][0].includes("[chuckle]"), JSON.stringify(cbCalls[0]));
+  cbCalls.length = 0;
+  const ref = fakeWav(24000 * 8, 7);
+  const refFile: DFile = { id: "ref_liam_clip_01", name: "narrator-ref.wav", mimeType: "audio/wav", parents: ["root"], data: ref };
+  drive.set(refFile.id, refFile);
+  const sentence = "This sentence is exactly long enough to need a few of them in a row. ";
+  const script = sentence.repeat(12).trim();
+  const long = await call("chatterbox_voiceover", { text: script, voice_drive_file: "ref_liam_clip_01", seed: 7, temperature: 0.5 });
+  const lf = drive.get(long.drive_file_id)!;
+  const pieces = cbCalls.map((d) => d[0] as string);
+  check("long scripts are split at sentence ends into pieces under 300 characters", pieces.length >= 3 && pieces.every((t) => t.length <= 300 && /\.$/.test(t)) && pieces.join(" ") === script, JSON.stringify(pieces.map((t) => t.length)));
+  check("the reference clip is uploaded once and every piece uses it with the same seed and temperature",
+    cbUploads.length === 1 && cbUploads[0] === ref.length && cbCalls.every((d) => d[1]?.path === "/tmp/gradio/ref/clip.wav" && d[3] === 7 && d[2] === 0.5), JSON.stringify(cbCalls.map((d) => [d[1]?.path, d[2], d[3]])));
+  const dataLen = lf.data.readUInt32LE(40);
+  const gap = Math.round(24000 * 0.12) * 2;
+  const expected = pieces.reduce((n, t) => n + t.length * 240 * 2, 0) + gap * (pieces.length - 1);
+  const secondStart = 44 + pieces[0].length * 240 * 2 + gap;
+  check("the pieces are joined in order with short gaps, and their start times are returned",
+    dataLen === expected && lf.data.length === 44 + expected && lf.data.readInt16LE(44) === 1 && lf.data.readInt16LE(secondStart) === 2 && lf.data.readInt16LE(secondStart - 2) === 0 &&
+    long.pieces.length === pieces.length && long.pieces[0].start === 0 && Math.abs(long.pieces[1].start - (pieces[0].length * 240 + gap / 2) / 24000) < 0.01 && Math.abs(long.seconds - expected / 48000) < 0.01,
+    JSON.stringify({ dataLen, expected, pieces: long.pieces.map((p: any) => p.start), seconds: long.seconds }));
+  cbMode = "quota";
+  const busy = await call("chatterbox_voiceover", { text: "Hello there." }).then(() => "", (e: Error) => e.message);
+  check("a GPU quota error says to fall back to Kokoro", /quota/i.test(busy) && /Kokoro/.test(busy), busy);
+  cbMode = "ok";
+  const tooLong = await call("chatterbox_voiceover", { text: "a".repeat(4001) }).then(() => "", (e: Error) => e.message);
+  check("over-long text is refused with a hint to split it", /at most 4000/.test(tooLong), tooLong);
 }
 
 const failed = results.filter((r) => !r[1]);
