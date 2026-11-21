@@ -73,7 +73,7 @@ export function parseWav(buf: ArrayBuffer): Pcm {
   throw new ToolError("Chatterbox returned a WAV file with no audio.");
 }
 
-export function joinWav(parts: Pcm[], gapS = GAP_S): { wav: Uint8Array; offsets: number[]; seconds: number } {
+export function joinWav(parts: Pcm[], gapS = GAP_S): { wav: Uint8Array; offsets: number[]; ends: number[]; seconds: number } {
   const { rate, channels, bits } = parts[0];
   if (parts.some((p) => p.rate !== rate || p.channels !== channels || p.bits !== bits)) throw new ToolError("Chatterbox pieces came back in different audio formats.");
   const frame = channels * bits / 8;
@@ -87,13 +87,14 @@ export function joinWav(parts: Pcm[], gapS = GAP_S): { wav: Uint8Array; offsets:
   v.setUint32(24, rate, true); v.setUint32(28, rate * frame, true); v.setUint16(32, frame, true); v.setUint16(34, bits, true);
   put(36, "data"); v.setUint32(40, dataLen, true);
   let o = 44;
-  const offsets: number[] = [];
+  const offsets: number[] = [], ends: number[] = [];
   parts.forEach((p, i) => {
     offsets.push((o - 44) / frame / rate);
     out.set(p.data, o); o += p.data.length;
+    ends.push((o - 44) / frame / rate);
     if (i < parts.length - 1) o += gap;              // zero bytes = silence
   });
-  return { wav: out, offsets, seconds: dataLen / frame / rate };
+  return { wav: out, offsets, ends, seconds: dataLen / frame / rate };
 }
 
 // ---------------------------------------------------------------- the Space
@@ -154,19 +155,27 @@ async function generatePiece(host: string, text: string, o: PieceOpts): Promise<
   return parseWav(await audio.arrayBuffer());
 }
 
-export interface Voiceover { wav: Uint8Array; seconds: number; pieces: { text: string; start: number }[] }
+export interface Voiceover { wav: Uint8Array; seconds: number; pieces: { text: string; start: number; end: number; line?: number }[] }
 
-export async function synthesize(text: string, opts: { reference?: { bytes: ArrayBuffer; name: string; mime: string }; temperature?: number; seed?: number }, deadlineMs: number): Promise<Voiceover> {
+/**
+ * `text`: one script, packed into pieces of up to 280 characters.
+ * `lines`: each line is its own piece (split further only when over 280 characters), so callers can cut the WAV back
+ * into per-line clips with the returned start/end times.
+ */
+export async function synthesize(input: { text?: string; lines?: string[] }, opts: { reference?: { bytes: ArrayBuffer; name: string; mime: string }; temperature?: number; seed?: number }, deadlineMs: number): Promise<Voiceover> {
   const host = spaceHost();
-  const pieces = splitScript(text);
+  const pieces: { text: string; line?: number }[] = input.lines
+    ? input.lines.flatMap((l, i) => splitScript(l).map((t) => ({ text: t, line: i })))
+    : splitScript(input.text ?? "").map((t) => ({ text: t }));
   if (!pieces.length) throw new ToolError("text is empty.");
   const prompt = opts.reference ? await uploadReference(host, opts.reference.bytes, opts.reference.name, opts.reference.mime) : await defaultPrompt(host);
   const o: PieceOpts = { prompt, temperature: opts.temperature ?? 0.8, seed: opts.seed ?? 42 };
   const pcm: Pcm[] = [];
   for (const p of pieces) {
     if (Date.now() > deadlineMs) throw new ToolError(`Ran out of time after ${pcm.length} of ${pieces.length} pieces. Send the script in shorter parts (about 1,500 characters each).`);
-    pcm.push(await generatePiece(host, p, o));
+    pcm.push(await generatePiece(host, p.text, o));
   }
-  const { wav, offsets, seconds } = joinWav(pcm);
-  return { wav, seconds, pieces: pieces.map((t, i) => ({ text: t, start: Math.round(offsets[i] * 100) / 100 })) };
+  const { wav, offsets, ends, seconds } = joinWav(pcm);
+  const r2 = (x: number) => Math.round(x * 1000) / 1000;
+  return { wav, seconds, pieces: pieces.map((p, i) => ({ text: p.text, start: r2(offsets[i]), end: r2(ends[i]), ...(p.line !== undefined ? { line: p.line } : {}) })) };
 }

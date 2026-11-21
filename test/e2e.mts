@@ -737,6 +737,15 @@ check("its token is refreshed when the cached one would expire within 20 minutes
     dataLen === expected && lf.data.length === 44 + expected && lf.data.readInt16LE(44) === 1 && lf.data.readInt16LE(secondStart) === 2 && lf.data.readInt16LE(secondStart - 2) === 0 &&
     long.pieces.length === pieces.length && long.pieces[0].start === 0 && Math.abs(long.pieces[1].start - (pieces[0].length * 240 + gap / 2) / 24000) < 0.01 && Math.abs(long.seconds - expected / 48000) < 0.01,
     JSON.stringify({ dataLen, expected, pieces: long.pieces.map((p: any) => p.start), seconds: long.seconds }));
+  cbCalls.length = 0;
+  const ls = ["Step one. Find a stump.", "Step two. Hollow it out.", "Done."];
+  const byLine = await call("chatterbox_voiceover", { lines: ls });
+  const lw = drive.get(byLine.drive_file_id)!;
+  const sampleAt = (t: number) => lw.data.readInt16LE(44 + Math.floor(t * 24000) * 2);
+  check("lines are read one per piece and come back with each line's start and end",
+    cbCalls.length === 3 && cbCalls.map((d) => d[0]).join("|") === ls.join("|") && byLine.pieces.map((p: any) => p.line).join() === "0,1,2" &&
+    byLine.pieces.every((p: any, i: number) => Math.abs(p.end - p.start - ls[i].length * 0.01) < 0.002 && sampleAt(p.start + 0.001) === i + 1) &&
+    Math.abs(byLine.pieces[1].start - byLine.pieces[0].end - 0.12) < 0.002, JSON.stringify(byLine.pieces));
   cbMode = "quota";
   const busy = await call("chatterbox_voiceover", { text: "Hello there." }).then(() => "", (e: Error) => e.message);
   check("a GPU quota error says to fall back to Kokoro", /quota/i.test(busy) && /Kokoro/.test(busy), busy);

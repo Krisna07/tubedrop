@@ -193,13 +193,15 @@ export const TOOLS = [
       "Generate a natural-sounding narration with Chatterbox Turbo (Resemble AI, run on a Hugging Face Space) and save it as a WAV " +
       "in a Google Drive folder (default 'Chatterbox Voiceovers'). Clone a narrator by passing voice_drive_file, a clean 5-15 second " +
       "clip of the voice in Drive. Paralinguistic tags in the text work: [chuckle], [laugh], [sigh], [gasp], [cough]. Long scripts " +
-      "are split at sentence ends and joined; the result lists when each piece starts, for captions. Returns drive_file_id; fetch it " +
+      "are split at sentence ends and joined. Pass `lines` instead of `text` to have each line read as its own piece: the result's " +
+      "pieces then give each line's start and end in the WAV (separated by 0.12 s of silence), so a script can cut it back into " +
+      "per-line clips and set its own timing. Returns drive_file_id; fetch it " +
       "into a sandbox with get_drive_download. The Space is a shared free GPU: if this errors as busy or out of quota, use Kokoro.",
     inputSchema: {
       type: "object",
-      required: ["text"],
       properties: {
         text: { type: "string", description: `The script to read, up to ${MAX_TEXT} characters. For longer narration, call once per section.` },
+        lines: { type: "array", items: { type: "string" }, description: `Alternative to text: the script as separate lines, each read on its own (up to ${MAX_TEXT} characters in total).` },
         voice_drive_file: { type: "string", description: "Drive file id or link of a 5-15 second reference clip (wav/mp3/m4a) to clone. Default: the Space's built-in voice." },
         file_name: { type: "string", description: "Name for the Drive file; .wav is added. Default voiceover-<time>." },
         folder: { type: "string", description: "Drive folder name or id. Default 'Chatterbox Voiceovers'." },
@@ -846,9 +848,11 @@ async function driveDownload(userId: string, a: Args) {
 
 async function chatterboxVoiceover(userId: string, a: Args) {
   const started = Date.now();
-  const text = String(a.text ?? "").trim();
-  if (!text) throw new ToolError("text is empty.");
-  if (text.length > MAX_TEXT) throw new ToolError(`text is ${text.length} characters; send at most ${MAX_TEXT} per call (split the script into sections).`);
+  const lines = Array.isArray(a.lines) ? a.lines.map((l: unknown) => String(l ?? "").trim()) : undefined;
+  if (lines && lines.some((l) => !l)) throw new ToolError("lines has an empty line.");
+  const text = lines ? lines.join(" ") : String(a.text ?? "").trim();
+  if (!text) throw new ToolError("Give text or lines.");
+  if (text.length > MAX_TEXT) throw new ToolError(`The script is ${text.length} characters; send at most ${MAX_TEXT} per call (split it into sections).`);
   const dr = await accessToken(userId, "drive");
   let reference: { bytes: ArrayBuffer; name: string; mime: string } | undefined;
   if (a.voice_drive_file) {
@@ -858,7 +862,7 @@ async function chatterboxVoiceover(userId: string, a: Args) {
     reference = { bytes: await driveBytes(dr, f.id), name: f.name, mime: f.mimeType };
   }
   const temperature = a.temperature === undefined ? undefined : Math.min(2, Math.max(0.05, Number(a.temperature)));
-  const v = await synthesize(text, { reference, temperature, seed: a.seed === undefined ? undefined : Math.trunc(Number(a.seed)) }, started + BUDGET_MS - 20_000);
+  const v = await synthesize(lines ? { lines } : { text }, { reference, temperature, seed: a.seed === undefined ? undefined : Math.trunc(Number(a.seed)) }, started + BUDGET_MS - 20_000);
   const name = cleanName(String(a.file_name ?? "").trim() || `voiceover-${new Date().toISOString().replace(/[:.]/g, "-")}`, "wav");
   const { session, folder, note } = await openImportSession(dr, name, "audio/wav", await importFolder(dr, a.folder ?? "Chatterbox Voiceovers"));
   const put = await fetch(session, { method: "PUT", headers: { "content-type": "audio/wav", "content-range": `bytes 0-${v.wav.length - 1}/${v.wav.length}` }, body: new Blob([v.wav as Uint8Array<ArrayBuffer>]) });
