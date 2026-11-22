@@ -142,9 +142,10 @@ async function generatePiece(host: string, text: string, o: PieceOpts): Promise<
   const done = events.find((e) => e.event === "complete");
   if (!done) {
     const err = events.find((e) => e.event === "error")?.data;
-    const busy = /quota|GPU|queue|exceeded/i.test(String(err));
-    throw new ToolError(`Chatterbox could not generate "${text.slice(0, 40)}...": ${err && err !== "null" ? err.slice(0, 300) : "the Space returned an error"}.` +
-      (busy ? " The free GPU is busy or out of quota; fall back to Kokoro for this run, or set HF_TOKEN on the server." : ""));
+    // ZeroGPU quota errors come back from the REST API as a bare `null`.
+    const busy = !err || err === "null" || /quota|GPU|queue|exceeded/i.test(String(err));
+    throw new ToolError(`Chatterbox could not generate "${text.slice(0, 40)}...": ${err && err !== "null" ? err.slice(0, 300) : "the Space returned an error with no message (usually the ZeroGPU quota is used up)"}.` +
+      (busy ? ` The free GPU is busy or out of quota; fall back to Kokoro for this run${process.env.HF_TOKEN ? "" : ", and set HF_TOKEN on the server so calls use your own Hugging Face quota"}.` : ""));
   }
   const out = JSON.parse(done.data) as Args[];
   const file = out?.[0];
